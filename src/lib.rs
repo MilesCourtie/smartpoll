@@ -8,6 +8,9 @@ use core::{
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod tests;
+
 /// Wrapper around a top-level [`Future`] that simplifies polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
