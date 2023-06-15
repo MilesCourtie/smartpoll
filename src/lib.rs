@@ -195,7 +195,7 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
 
         /* SAFETY:
             It is safe to create a `Waker` from a `RawWaker` constructed from `data` and `VTABLE`
-            because the contracts described in `RawWaker`'s and `RawWakerVTable`'s documentation is
+            because the contracts described in `RawWaker`'s and `RawWakerVTable`'s documentation are
             upheld:
               - `clone` creates a clone of the `RawWaker` which wakes the same task, and retains all
                 resources that are required for both `RawWaker`s and the task.
