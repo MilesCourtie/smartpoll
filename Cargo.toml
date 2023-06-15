@@ -1,0 +1,8 @@
+[package]
+name = "smartpoll"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.parking_lot]
+version = "0.12"
+features = ["hardware-lock-elision"]
