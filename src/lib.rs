@@ -16,7 +16,7 @@ pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
 /// Dynamically-sized type which contains the shared state needed to coordinate rescheduling the
 /// task, as well as the task's [`Future`].
-struct TaskInner<F: Future<Output = ()>> {
+struct TaskInner<F: Future<Output = ()> + Send> {
     /// marks this type as !Unpin
     _pin: PhantomPinned,
 
@@ -48,9 +48,8 @@ impl Task {
         Self(Arc::<_>::pin(TaskInner::new(future)))
     }
 
-    /// Polls the task. If the future does not complete, the 'reschedule' callback will be invoked
-    /// sometime after `Future::poll()` has returned, and will be given a [`Task`] containing the
-    /// future.
+    /// Polls the task. If the future does not complete, `reschedule_fn` will be invoked sometime
+    /// after `Future::poll()` has returned and will be given a [`Task`] containing the future.
     pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) {
         // Read the task's wake counter and use it to create a new waker
         // This is guaranteed to be the only valid waker as any existing wakers were invalidated
@@ -116,7 +115,7 @@ impl Task {
     }
 }
 
-impl<F: Future<Output = ()>> TaskInner<F> {
+impl<F: Future<Output = ()> + Send> TaskInner<F> {
     fn new(future: F) -> Self {
         let shared_state = Mutex::new(SharedState {
             wake_counter: 0,
@@ -132,10 +131,10 @@ impl<F: Future<Output = ()>> TaskInner<F> {
 }
 
 /// enables dynamic dispatch over any `TaskInner`
-trait AnyTaskInner {
+trait AnyTaskInner: Send + Sync {
     /// Polls the task's future using the provided waker. Should only be called by `Task::poll`.
     ///
-    /// # SAFETY
+    /// # Safety
     ///
     /// The caller must guarantee that this function will not be called again by any thread until
     /// it has returned, even if the waker is invoked before this function returns.
@@ -145,7 +144,18 @@ trait AnyTaskInner {
     fn shared_state(&self) -> &Mutex<SharedState>;
 }
 
-impl<F: Future<Output = ()>> AnyTaskInner for TaskInner<F> {
+/* SAFETY:
+    It is safe to implement sync for `TaskInner` because the only non-sync type it contains is
+    `UnsafeCell<F>` where `F` is the future type. Because access to the `UnsafeCell` is
+    synchronised manually by the implementations of `TaskInner` and `Task`, this type can safely
+    be shared between threads.
+
+    Furthermore, the future contained within the `TaskInner` does not need to be `Sync` because
+    access to it is synchronised as described above.
+*/
+unsafe impl<F: Future<Output = ()> + Send> Sync for TaskInner<F> {}
+
+impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()> {
         /* SAFETY:
             Because the caller has guaranteed that this function will not be called again by any
