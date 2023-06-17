@@ -36,24 +36,21 @@ mod common {
         }
     }
 
-    /// A `Future` type which can be used to yield control to the executor once.
-    /// The first time it is polled it will invoke the waker and then return `Poll::Pending`.
-    /// The second time it is polled it will return `Poll::Ready(())`.
-    pub struct Yield(bool);
-    impl Yield {
-        pub fn new() -> Self {
-            Self(false)
-        }
+    /// Returns a future which yields control to the executor once.
+    pub fn yield_now() -> Yield {
+        Yield(false)
     }
+    /// A future type that yields control to the executor once.
+    pub struct Yield(bool);
     impl Future for Yield {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
+            if !self.0 {
                 self.0 = true;
                 cx.waker().wake_by_ref();
                 Poll::Pending
+            } else {
+                Poll::Ready(())
             }
         }
     }
@@ -78,11 +75,11 @@ fn basic_usage() {
         let order = order.clone();
         Task::new(async move {
             order.assert(1);
-            Yield::new().await;
+            yield_now().await;
             order.assert(2);
             let fut = async {
                 order.assert(4);
-                Yield::new().await;
+                yield_now().await;
                 order.assert(5);
             };
             order.assert(3);
