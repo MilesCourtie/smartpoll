@@ -1,7 +1,14 @@
 [package]
 name = "smartpoll"
+description = "A 'Task' abstraction that simplifies polling futures."
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+readme = "README.md"
+homepage = "https://github.com/MilesCourtie/smartpoll"
+repository = "https://github.com/MilesCourtie/smartpoll"
+categories = ["asynchronous"]
+keywords = ["async", "executor", "futures", "task"]
 
 [dependencies.parking_lot]
 version = "0.12"
