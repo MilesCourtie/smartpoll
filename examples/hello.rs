@@ -1,4 +1,4 @@
-//! This example demonstrates the simplest possible usage of `smartpoll`.
+//! This example demonstrates the simplest possible usage of Smartpoll.
 //! A future that prints "hello world!" is wrapped in a [`Task`] and polled using [`Task::poll`].
 //!
 //! Polling a [`Task`] requires providing a callback that will be invoked when the task is ready

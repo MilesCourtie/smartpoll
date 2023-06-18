@@ -1,8 +1,8 @@
-//! This example demonstrates using `smartpoll` to run a future that sometimes yields control to the
+//! This example demonstrates using Smartpoll to run a future that sometimes yields control to the
 //! executor.
 
-use smartpoll::Task;
 use core::{future::Future, pin::Pin, task::Context, task::Poll};
+use smartpoll::Task;
 
 fn main() {
     let task = Task::new(async {
