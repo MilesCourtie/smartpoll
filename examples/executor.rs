@@ -52,7 +52,7 @@ impl Executor {
         let num_workers: usize = thread::available_parallelism().unwrap().into();
 
         // the main work queue
-        let (queue_tx, queue_rx) = mpsc::channel::<Task>();
+        let (queue_tx, queue_rx) = mpsc::channel();
 
         // function that pushes a task onto the work queue
         let reschedule_fn = {
@@ -119,7 +119,6 @@ impl Executor {
                             self.next_worker = 0;
                         }
                     }
-                    {}
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
