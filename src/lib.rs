@@ -1,3 +1,5 @@
+extern crate alloc;
+use alloc::sync::Arc;
 use core::{
     cell::UnsafeCell,
     future::Future,
@@ -6,7 +8,6 @@ use core::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 use parking_lot::Mutex;
-use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
