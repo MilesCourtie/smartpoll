@@ -9,7 +9,3 @@ homepage = "https://github.com/MilesCourtie/smartpoll"
 repository = "https://github.com/MilesCourtie/smartpoll"
 categories = ["asynchronous"]
 keywords = ["async", "executor", "futures", "task"]
-
-[dependencies.parking_lot]
-version = "0.12"
-features = ["hardware-lock-elision"]

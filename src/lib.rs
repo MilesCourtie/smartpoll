@@ -5,9 +5,9 @@ use core::{
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-use parking_lot::Mutex;
 
 #[cfg(test)]
 mod tests;
@@ -22,7 +22,7 @@ struct TaskInner<F: Future<Output = ()> + Send> {
     _pin: PhantomPinned,
 
     /// state that is used to communicate between wakers and `Task::poll()`
-    shared_state: Mutex<SharedState>,
+    shared_state: SharedState,
 
     /* SAFETY:
         This field must only be accessed from within `TaskInner::poll()`.
@@ -34,13 +34,10 @@ struct TaskInner<F: Future<Output = ()> + Send> {
 /// returns `Pending`, the task is not rescheduled until after `TaskInner::poll` has returned.
 struct SharedState {
     /// monotonic counter for how many times this task has been rescheduled
-    wake_counter: u64,
+    wake_counter: AtomicU64,
 
-    /// flag to communicate whether a waker has been invoked for the most recent poll
-    waker_invoked: bool,
-
-    /// flag to communicate whether the most recent poll has completed
-    poll_finished: bool,
+    /// flag to communicate whether the next waker should reschedule the task
+    should_wake: AtomicBool,
 }
 
 impl Task {
@@ -52,13 +49,12 @@ impl Task {
     /// Polls the task. If the future does not complete, `reschedule_fn` will be invoked sometime
     /// after `Future::poll()` has returned and will be given a [`Task`] containing the future.
     pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) {
+        let shared_state = self.0.shared_state();
+
         // Read the task's wake counter and use it to create a new waker
         // This is guaranteed to be the only valid waker as any existing wakers were invalidated
         // when the task was last rescheduled (as the wake counter was incremented).
-        let wake_counter = {
-            let shared_state = self.0.shared_state().lock();
-            shared_state.wake_counter
-        };
+        let wake_counter = shared_state.wake_counter.load(Ordering::Acquire);
         let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), wake_counter);
 
         /* SAFETY:
@@ -73,44 +69,44 @@ impl Task {
         let result = unsafe { self.0.as_ref().poll(&waker) };
 
         if result.is_pending() {
-            // the future has not yet completed, so it must be rescheduled either here or by a waker
-            let reschedule_now: bool;
-            {
-                let mut shared_state = self.0.shared_state().lock();
-                // if one or more wakers were invoked while the future was being polled
-                if shared_state.waker_invoked {
-                    // we must reschedule the task here as the wakers will not have done so
-                    reschedule_now = true;
-                    // and increment the wake counter to invalidate any remaining wakers
-                    shared_state.wake_counter += 1;
-                    // lastly we reset the shared state ready for the next poll
-                    shared_state.poll_finished = false;
-                    shared_state.waker_invoked = false;
-                } else {
-                    // if no wakers have been invoked yet we must communicate that the task has
-                    // finished being polled, so that the first waker to be invoked knows it must
-                    // reschedule the task.
-                    shared_state.poll_finished = true;
+            let waker_invoked = shared_state.wake_counter.load(Ordering::SeqCst) != wake_counter;
 
-                    // we mustn't reschedule the future yet as no wakers have been invoked yet
-                    reschedule_now = false;
+            if waker_invoked {
+                // A waker was invoked before poll() had finished. It did not reschedule the task, but did
+                // increment the counter. The task must be rescheduled here instead.
+                reschedule_fn(self);
+            } else {
+                // No wakers have been invoked yet for the most recent poll() invocation.
+                // We must set 'should_wake' so that the next valid waker reschedules the task.
+                loop {
+                    match shared_state.should_wake.compare_exchange_weak(
+                        false,
+                        true,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(false) => break, // success
+                        Ok(true) => unreachable!(),
+                        Err(false) => continue, // retry
+                        Err(true) => panic!("BUG: should_wake was not reset"),
+                    }
                 }
             }
-            // to keep the critical section short the reschedule callback is invoked outside of it
-            if reschedule_now {
-                reschedule_fn(self);
-            }
         } else {
-            // the future has completed, so does not need to be rescheduled
-            {
-                let mut shared_state = self.0.shared_state().lock();
-                // There *should* be no valid wakers as `Future::poll()` shouldn't have used the one
-                // we provided. In case the future did use the waker we provided, we increment the
-                // wake counter to invalidate it.
-                shared_state.wake_counter += 1;
-                // lastly we reset the shared state ready for the next poll
-                shared_state.poll_finished = false;
-                shared_state.waker_invoked = false;
+            // poll() returned Poll::Ready
+            // even though there should be no valid wakers, increment the counter to invalidate them just in case
+            loop {
+                match shared_state.wake_counter.compare_exchange_weak(
+                    wake_counter,
+                    wake_counter + 1,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(c) if c == wake_counter => break, // success
+                    Ok(_) => unreachable!(),
+                    Err(c) if c == wake_counter => continue, // retry
+                    Err(_) => break, // there was a valid waker, but all it did was increment the counter for us
+                }
             }
         }
     }
@@ -118,11 +114,10 @@ impl Task {
 
 impl<F: Future<Output = ()> + Send> TaskInner<F> {
     fn new(future: F) -> Self {
-        let shared_state = Mutex::new(SharedState {
-            wake_counter: 0,
-            waker_invoked: false,
-            poll_finished: false,
-        });
+        let shared_state = SharedState {
+            wake_counter: AtomicU64::new(0),
+            should_wake: AtomicBool::new(false),
+        };
         Self {
             _pin: PhantomPinned,
             shared_state,
@@ -141,8 +136,8 @@ trait AnyTaskInner: Send + Sync {
     /// it has returned, even if the waker is invoked before this function returns.
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()>;
 
-    /// Returns a shared reference to the mutex guarding the task's shared state.
-    fn shared_state(&self) -> &Mutex<SharedState>;
+    /// Returns a shared reference to the task's shared state.
+    fn shared_state(&self) -> &SharedState;
 }
 
 /* SAFETY:
@@ -175,7 +170,7 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
         future.poll(&mut Context::from_waker(waker))
     }
 
-    fn shared_state(&self) -> &Mutex<SharedState> {
+    fn shared_state(&self) -> &SharedState {
         &self.shared_state
     }
 }
@@ -263,25 +258,41 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         */
         let this = unsafe { Box::from_raw(data as *mut Self) };
 
-        // determine whether this particular waker instance should reschedule the future
-        let mut reschedule_now = false;
-        {
-            let mut shared_state = this.task_inner.shared_state().lock();
-            // if the wake counter doesn't match then the future has already been rescheduled
-            if shared_state.wake_counter == this.wake_counter {
-                // if the future has finished being polled then this waker should reschedule it
-                if shared_state.poll_finished {
-                    shared_state.wake_counter += 1;
-                    reschedule_now = true;
-                } else {
-                    // otherwise we must communicate that a waker has been invoked so that the
-                    // future can be rescheduled as soon as `poll` returns
-                    shared_state.waker_invoked = true;
-                }
+        let shared_state = this.task_inner.shared_state();
+
+        // find out whether the next waker to run should reschedule the task
+        let should_wake = loop {
+            match shared_state.should_wake.compare_exchange_weak(
+                true,
+                false,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(true) => break true,
+                Ok(false) => unreachable!(),
+                Err(true) => continue,
+                Err(false) => break false,
             }
-        }
-        // to keep the critical section short the reschedule callback is invoked outside of it
-        if reschedule_now {
+        };
+
+        // find out if any other valid waker has already been invoked before this one
+        let other_waker_invoked = loop {
+            match shared_state.wake_counter.compare_exchange_weak(
+                this.wake_counter,
+                this.wake_counter + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(c) if c == this.wake_counter => break false,
+                Ok(_) => unreachable!(),
+                Err(c) if c == this.wake_counter => continue,
+                Err(_) => break true,
+            }
+        };
+
+        // if we successfully set should_wake to false and incremented wake_counter,
+        // this is the waker that must reschedule the task
+        if should_wake && !other_waker_invoked {
             (this.reschedule_fn)(Task(this.task_inner.clone()));
         }
 
