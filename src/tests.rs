@@ -7,15 +7,15 @@ use core::{
 };
 
 mod common {
+    use crate::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use crate::Task;
     use core::{
         future::Future,
         pin::Pin,
         task::{Context, Poll},
-    };
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
     };
 
     /// A simple helper for asserting execution order using an atomic counter.
@@ -69,28 +69,37 @@ mod common {
 #[test]
 fn basic_usage() {
     use common::*;
-    let order = ExecutionOrder::new();
 
-    let task = {
-        let order = order.clone();
-        Task::new(async move {
-            order.assert(1);
-            yield_now().await;
-            order.assert(2);
-            let fut = async {
-                order.assert(4);
+    fn test() {
+        let order = ExecutionOrder::new();
+
+        let task = {
+            let order = order.clone();
+            Task::new(async move {
+                order.assert(1);
                 yield_now().await;
-                order.assert(5);
-            };
-            order.assert(3);
-            fut.await;
-            order.assert(6);
-        })
-    };
+                order.assert(2);
+                let fut = async {
+                    order.assert(4);
+                    yield_now().await;
+                    order.assert(5);
+                };
+                order.assert(3);
+                fut.await;
+                order.assert(6);
+            })
+        };
 
-    order.assert(0);
-    task.poll(recursive_poll);
-    order.assert(7);
+        order.assert(0);
+        task.poll(recursive_poll);
+        order.assert(7);
+    }
+
+    #[cfg(loom)]
+    loom::model(test);
+
+    #[cfg(not(loom))]
+    test();
 }
 
 /// Test that cloning a `SmartWaker` does not panic.
@@ -108,5 +117,13 @@ fn clone_waker() {
         }
     }
 
-    Task::new(F).poll(recursive_poll);
+    fn test() {
+        Task::new(F).poll(recursive_poll);
+    }
+
+    #[cfg(loom)]
+    loom::model(test);
+
+    #[cfg(not(loom))]
+    test();
 }

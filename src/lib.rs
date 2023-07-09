@@ -1,12 +1,15 @@
-extern crate alloc;
-use alloc::sync::Arc;
 use core::{
-    cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+};
+
+mod sync;
+use sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    cell::UnsafeCell,
+    Arc,
 };
 
 #[cfg(test)]
@@ -43,7 +46,25 @@ struct SharedState {
 impl Task {
     /// Converts the provided [`Future`] into a [`Task`].
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self(Arc::<_>::pin(TaskInner::new(future)))
+        #[cfg(not(loom))]
+        let inner = Arc::pin(TaskInner::new(future));
+
+        #[cfg(loom)]
+        let inner = {
+            let inner: sync::StdArc<dyn AnyTaskInner + 'static> =
+                sync::StdArc::new(TaskInner::new(future));
+            let inner = Arc::from_std(inner);
+
+            /* SAFETY
+                This is safe for the same reason that the implementation of loom::sync::Arc::pin()
+                is safe.
+
+                see:    https://docs.rs/loom/0.6.0/src/loom/sync/arc.rs.html#24
+            */
+            unsafe { Pin::new_unchecked(inner) }
+        };
+
+        Self(inner)
     }
 
     /// Polls the task. If the future does not complete, `reschedule_fn` will be invoked sometime
@@ -142,21 +163,24 @@ unsafe impl<F: Future<Output = ()> + Send> Sync for TaskInner<F> {}
 
 impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()> {
-        /* SAFETY:
-            Because the caller has guaranteed that this function will not be called again by any
-            thread until it has returned, and because no other code accesses the UnsafeCell, it is
-            safe to assume that this function has exclusive access to the UnsafeCell.
-        */
-        let future = unsafe { &mut *self.future.get() };
+        // uses the API for loom::cell::UnsafeCell instead of core::cell::UnsafeCell
+        self.future.with_mut(|future| {
+            /* SAFETY:
+                Because the caller has guaranteed that this function will not be called again by any
+                thread until it has returned, and because no other code accesses the UnsafeCell, it is
+                safe to assume that this function has exclusive access to the future in the UnsafeCell.
+            */
+            let future = unsafe { &mut *future };
 
-        /* SAFETY:
-            Because the type that contains the future is explicitly marked as !Unpin and is accessed
-            here through a `Pin`, it is safe to assume that the future will not be moved.
-            Hence it is safe to create a pinned reference to it.
-        */
-        let future = unsafe { Pin::new_unchecked(future) };
+            /* SAFETY:
+                Because the type that contains the future is explicitly marked as !Unpin and is accessed
+                here through a `Pin`, it is safe to assume that the future will not be moved.
+                Hence it is safe to create a pinned reference to it.
+            */
+            let future = unsafe { Pin::new_unchecked(future) };
 
-        future.poll(&mut Context::from_waker(waker))
+            future.poll(&mut Context::from_waker(waker))
+        })
     }
 
     fn shared_state(&self) -> &SharedState {
