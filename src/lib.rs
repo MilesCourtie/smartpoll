@@ -78,36 +78,25 @@ impl Task {
             } else {
                 // No wakers have been invoked yet for the most recent poll() invocation.
                 // We must set 'should_wake' so that the next valid waker reschedules the task.
-                loop {
-                    match shared_state.should_wake.compare_exchange_weak(
-                        false,
-                        true,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(false) => break, // success
-                        Ok(true) => unreachable!(),
-                        Err(false) => continue, // retry
-                        Err(true) => panic!("BUG: should_wake was not reset"),
-                    }
-                }
+                shared_state
+                    .should_wake
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .expect("BUG: should_wake was not reset");
             }
         } else {
             // poll() returned Poll::Ready
             // even though there should be no valid wakers, increment the counter to invalidate them just in case
-            loop {
-                match shared_state.wake_counter.compare_exchange_weak(
-                    wake_counter,
-                    wake_counter + 1,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(c) if c == wake_counter => break, // success
-                    Ok(_) => unreachable!(),
-                    Err(c) if c == wake_counter => continue, // retry
-                    Err(_) => break, // there was a valid waker, but all it did was increment the counter for us
-                }
-            }
+            let result = shared_state.wake_counter.compare_exchange(
+                wake_counter,
+                wake_counter + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            // If result is Ok(), the future did not use the waker we provided, which is expected as it returned
+            // Poll::Ready.
+            // If result is Err() then the future did use the waker, which it wasn't supposed to, but all that
+            // the waker did was increment the counter which is what we were trying to do anyway.
+            let _ = result;
         }
     }
 }
@@ -261,34 +250,21 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         let shared_state = this.task_inner.shared_state();
 
         // find out whether the next waker to run should reschedule the task
-        let should_wake = loop {
-            match shared_state.should_wake.compare_exchange_weak(
-                true,
-                false,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(true) => break true,
-                Ok(false) => unreachable!(),
-                Err(true) => continue,
-                Err(false) => break false,
-            }
-        };
+        let should_wake = shared_state
+            .should_wake
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
 
         // find out if any other valid waker has already been invoked before this one
-        let other_waker_invoked = loop {
-            match shared_state.wake_counter.compare_exchange_weak(
+        let other_waker_invoked = shared_state
+            .wake_counter
+            .compare_exchange(
                 this.wake_counter,
                 this.wake_counter + 1,
                 Ordering::SeqCst,
                 Ordering::Relaxed,
-            ) {
-                Ok(c) if c == this.wake_counter => break false,
-                Ok(_) => unreachable!(),
-                Err(c) if c == this.wake_counter => continue,
-                Err(_) => break true,
-            }
-        };
+            )
+            .is_err();
 
         // if we successfully set should_wake to false and incremented wake_counter,
         // this is the waker that must reschedule the task
