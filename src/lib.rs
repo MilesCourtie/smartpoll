@@ -93,8 +93,8 @@ impl Task {
             let waker_invoked = shared_state.wake_counter.load(Ordering::SeqCst) != wake_counter;
 
             if waker_invoked {
-                // A waker was invoked before poll() had finished. It did not reschedule the task, but did
-                // increment the counter. The task must be rescheduled here instead.
+                // A waker was invoked before poll() had finished. It did not reschedule the task,
+                // but did increment the counter. The task must be rescheduled here instead.
                 reschedule_fn(self);
             } else {
                 // No wakers have been invoked yet for the most recent poll() invocation.
@@ -106,17 +106,19 @@ impl Task {
             }
         } else {
             // poll() returned Poll::Ready
-            // even though there should be no valid wakers, increment the counter to invalidate them just in case
+            // Even though there should be no valid wakers, increment the counter to invalidate them
+            // just in case.
             let result = shared_state.wake_counter.compare_exchange(
                 wake_counter,
                 wake_counter + 1,
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             );
-            // If result is Ok(), the future did not use the waker we provided, which is expected as it returned
-            // Poll::Ready.
-            // If result is Err() then the future did use the waker, which it wasn't supposed to, but all that
-            // the waker did was increment the counter which is what we were trying to do anyway.
+            // If result is Ok(), the future did not use the waker we provided, which is expected as
+            // it returned Poll::Ready.
+            // If result is Err() then the future did use the waker, which it wasn't supposed to,
+            // but all that the waker did was increment the counter which is what we were trying to
+            // do anyway.
             let _ = result;
         }
     }
@@ -167,15 +169,16 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
         self.future.with_mut(|future| {
             /* SAFETY:
                 Because the caller has guaranteed that this function will not be called again by any
-                thread until it has returned, and because no other code accesses the UnsafeCell, it is
-                safe to assume that this function has exclusive access to the future in the UnsafeCell.
+                thread until it has returned, and because no other code accesses the UnsafeCell, it
+                is safe to assume that this function has exclusive access to the future in the
+                UnsafeCell.
             */
             let future = unsafe { &mut *future };
 
             /* SAFETY:
-                Because the type that contains the future is explicitly marked as !Unpin and is accessed
-                here through a `Pin`, it is safe to assume that the future will not be moved.
-                Hence it is safe to create a pinned reference to it.
+                Because the type that contains the future is explicitly marked as !Unpin and is
+                accessed here through a `Pin`, it is safe to assume that the future will not be
+                moved. Hence it is safe to create a pinned reference to it.
             */
             let future = unsafe { Pin::new_unchecked(future) };
 
