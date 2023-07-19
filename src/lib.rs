@@ -69,7 +69,8 @@ impl Task {
 
     /// Polls the task. If the future does not complete, `reschedule_fn` will be invoked sometime
     /// after `Future::poll()` has returned and will be given a [`Task`] containing the future.
-    pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) {
+    /// Returns `true` iff the task has completed.
+    pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
         let shared_state = self.0.shared_state();
 
         // Read the task's wake counter and use it to create a new waker
@@ -121,6 +122,7 @@ impl Task {
             // do anyway.
             let _ = result;
         }
+        result.is_ready()
     }
 }
 

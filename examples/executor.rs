@@ -70,7 +70,7 @@ impl Executor {
                 let join_handle = thread::spawn(move || {
                     // poll tasks until the channel closes
                     while let Ok(task) = task_rx.recv() {
-                        task.poll(reschedule_fn.clone())
+                        task.poll(reschedule_fn.clone());
                     }
                 });
                 Some(Worker {
