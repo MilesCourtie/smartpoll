@@ -1,52 +1,39 @@
+#![allow(dead_code)]
+
 use crate::Task;
 use core::{
     future::Future,
-    hint::black_box,
     pin::Pin,
     task::{Context, Poll},
 };
 
-mod common {
-    use crate::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    use crate::Task;
-    use core::{
-        future::Future,
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    /// A simple helper for asserting execution order using an atomic counter.
-    /// Uses `SeqCst` memory ordering.
-    #[derive(Clone)]
-    pub struct ExecutionOrder(Arc<AtomicUsize>);
-    impl ExecutionOrder {
-        pub fn new() -> Self {
-            Self(Arc::new(AtomicUsize::new(0)))
-        }
-        pub fn assert(&self, val: usize) {
-            assert!(
-                self.0
-                    .compare_exchange(val, val + 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok(),
-                "out of order: {val}"
-            );
+/// Tests using `Task::poll()` with the simplest possible future.
+#[cfg(not(loom))]
+#[test]
+fn test_0() {
+    struct Fut;
+    impl Future for Fut {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(())
         }
     }
-
-    /// Returns a future which yields control to the executor once.
-    pub fn yield_now() -> Yield {
-        Yield(false)
+    fn recursive_poll(task: Task) {
+        task.poll(recursive_poll);
     }
-    /// A future type that yields control to the executor once.
-    pub struct Yield(bool);
-    impl Future for Yield {
+    recursive_poll(Task::new(Fut));
+}
+
+/// Tests using `Task` to poll a future which doesn't immediately complete.
+#[cfg(not(loom))]
+#[test]
+fn test_1() {
+    struct Fut(u8);
+    impl Future for Fut {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if !self.0 {
-                self.0 = true;
+            if self.0 > 0 {
+                self.0 -= 1;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             } else {
@@ -54,76 +41,69 @@ mod common {
             }
         }
     }
-
-    /// The simplest possible reschedule callback that can be passed to `Task::poll()`.
-    /// When invoked, it polls the task immediately using itself as the reschedule callback.
-    pub fn recursive_poll(task: Task) {
+    fn recursive_poll(task: Task) {
         task.poll(recursive_poll);
     }
+    recursive_poll(Task::new(Fut(2)));
 }
 
-/// Test that `Task`s can be used to poll a future that returns both `Pending` and `Ready`, and
-/// contains another future that also does so.
-/// This also tests whether creating, invoking and dropping a `SmartWaker` works correctly and
-/// does not panic.
+/// Tests that when a single waker is used, a task is never rescheduled until after poll() returns.
+#[cfg(loom)]
 #[test]
-fn basic_usage() {
-    use common::*;
+fn test_2() {
+    use loom::{sync::mpsc::channel, thread};
 
-    fn test() {
-        let order = ExecutionOrder::new();
-
-        let task = {
-            let order = order.clone();
-            Task::new(async move {
-                order.assert(1);
-                yield_now().await;
-                order.assert(2);
-                let fut = async {
-                    order.assert(4);
-                    yield_now().await;
-                    order.assert(5);
-                };
-                order.assert(3);
-                fut.await;
-                order.assert(6);
-            })
-        };
-
-        order.assert(0);
-        task.poll(recursive_poll);
-        order.assert(7);
+    struct Fut {
+        polls_remaining: u8,
     }
-
-    #[cfg(loom)]
-    loom::model(test);
-
-    #[cfg(not(loom))]
-    test();
-}
-
-/// Test that cloning a `SmartWaker` does not panic.
-#[test]
-fn clone_waker() {
-    use common::*;
-
-    struct F;
-    impl Future for F {
+    impl Fut {
+        fn new(polls_remaining: u8) -> Self {
+            Self { polls_remaining }
+        }
+    }
+    impl Future for Fut {
         type Output = ();
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let waker = cx.waker().clone();
-            black_box(waker); // act as if the waker is used in some way
-            Poll::Ready(())
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let output = if self.polls_remaining > 0 {
+                self.polls_remaining -= 1;
+                let waker = cx.waker().clone();
+                thread::spawn(move || {
+                    waker.wake();
+                });
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            };
+            output
         }
     }
 
-    fn test() {
-        Task::new(F).poll(recursive_poll);
+    fn test_body() {
+        let (tx, rx) = channel();
+
+        let reschedule_fn = {
+            let tx = tx.clone();
+            move |task| {
+                tx.send(task).expect("channel disconnected");
+            }
+        };
+
+        let task = Task::new(Fut::new(1));
+        tx.send(task).expect("channel disconnected");
+
+        loop {
+            match rx.recv() {
+                Ok(task) => {
+                    if task.poll(reschedule_fn.clone()) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    panic!("channel disconnected");
+                }
+            }
+        }
     }
 
-    #[cfg(loom)]
-    loom::model(test);
-
-    #[cfg(not(loom))]
-    test();
+    loom::model(test_body);
 }
