@@ -7,7 +7,7 @@ use core::{
 
 mod sync;
 use sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc, UnsafeCell,
 };
 
@@ -37,12 +37,31 @@ struct TaskInner<F: Future<Output = ()> + Send> {
 /// rescheduled while it is still being polled.
 struct SharedState {
     /// A progress counter that is used to coordinate task rescheduling.
-    /// When the task is polled and returns `Pending`, the counter is incremented by the first waker
-    /// to be invoked. It is incremented again by whichever thread ends up rescheduling the task.
-    progress: AtomicU64,
-
-    /// A flag used to communicate to the wakers whether the task needs to be rescheduled.
-    reschedule: AtomicBool,
+    /// Each time the task goes through the cycle of being polled and rescheduled, the counter
+    /// is incremented by 4. The process is as follows:
+    ///  1. Initially the counter is equal to 4N, where N is a non-negative integer. A waker is
+    ///     created that stores the number 4N so that it can check it is still valid when invoked.
+    ///  2. The future is polled and does not complete, so arranges for the waker to be invoked.
+    ///     It may create multiple copies of the waker and arrange for many of them to be invoked.
+    ///  3. If a waker is invoked while the future is still being polled, it sets the counter to
+    ///     4N+1 iff its value is 4N. If this fails, another waker was invoked so this one halts.
+    ///  4. Once `Task::poll` has finished polling the future, it increments the counter by 2,
+    ///     noting the value it is replacing. Iff the value was 4N+1 it knows a waker has been
+    ///     invoked, otherwise it halts as there is nothing left to do until a waker is invoked.
+    ///  5. If a waker is invoked while the counter is 4N+2 or 4N+3, it will try to increment the
+    ///     counter to 4N+1 but fail as the value isn't 4N. The waker will know from the counter's
+    ///     value that (a) the task has finished being polled, and (b) whether another waker has
+    ///     already been invoked.
+    ///  6. The waker that incremented the counter and `Task::poll` (if it didn't halt in step 4)
+    ///     try to increase the counter to 4N+4 using `compare_exchange`.
+    ///     Whichever one succeeds then reschedules the task, and the counter is equal to 4(N+1).
+    ///
+    /// N.B.
+    ///  *1 Initially the counter is 0, and occasionally it is reset to 0 before step 1, if there
+    ///     are no wakers, to prevent it from overflowing.
+    ///  *2 If the future completes in step 2, the counter is set to 4N+4 by `Task::poll` and is not
+    ///     modified again as a result.
+    progress: AtomicUsize,
 }
 
 impl Task {
@@ -80,7 +99,7 @@ impl Task {
         // Use the task's progress counter to create a new waker.
         // This is guaranteed to be the only waker with this 'progress' value, as the counter was
         // incremented when the task was last rescheduled.
-        let progress = shared_state.progress.load(Ordering::Acquire);
+        let progress = shared_state.progress.load(Ordering::SeqCst);
         let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), progress);
 
         /* SAFETY:
