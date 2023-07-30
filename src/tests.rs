@@ -51,48 +51,63 @@ fn test_1() {
 #[cfg(loom)]
 #[test]
 fn test_2() {
-    use loom::{sync::mpsc::channel, thread};
+    use core::task::Waker;
+    use loom::{
+        sync::mpsc::{channel, Sender},
+        thread,
+    };
 
     struct Fut {
         polls_remaining: u8,
+        waker_tx: Sender<Waker>,
     }
     impl Fut {
-        fn new(polls_remaining: u8) -> Self {
-            Self { polls_remaining }
+        fn new(polls_remaining: u8, waker_tx: Sender<Waker>) -> Self {
+            Self {
+                polls_remaining,
+                waker_tx,
+            }
         }
     }
     impl Future for Fut {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let output = if self.polls_remaining > 0 {
+            if self.polls_remaining > 0 {
                 self.polls_remaining -= 1;
-                let waker = cx.waker().clone();
-                thread::spawn(move || {
-                    waker.wake();
-                });
+                self.waker_tx
+                    .send(cx.waker().clone())
+                    .expect("channel closed");
                 Poll::Pending
             } else {
                 Poll::Ready(())
-            };
-            output
+            }
         }
     }
 
     fn test_body() {
-        let (tx, rx) = channel();
+        let (task_tx, task_rx) = channel();
 
         let reschedule_fn = {
-            let tx = tx.clone();
+            let task_tx = task_tx.clone();
             move |task| {
-                tx.send(task).expect("channel disconnected");
+                task_tx.send(task).expect("channel disconnected");
             }
         };
 
-        let task = Task::new(Fut::new(1));
-        tx.send(task).expect("channel disconnected");
+        let (waker_tx, waker_rx) = channel::<Waker>();
+
+        let _waker_thread = thread::spawn(move || {
+            while let Ok(waker) = waker_rx.recv() {
+                waker.wake();
+            }
+        });
+
+        let task = Task::new(Fut::new(3, waker_tx));
+
+        task_tx.send(task).expect("channel disconnected");
 
         loop {
-            match rx.recv() {
+            match task_rx.recv() {
                 Ok(task) => {
                     if task.poll(reschedule_fn.clone()) {
                         break;
