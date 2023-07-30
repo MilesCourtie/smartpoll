@@ -8,8 +8,7 @@ use core::{
 mod sync;
 use sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    cell::UnsafeCell,
-    Arc,
+    Arc, UnsafeCell,
 };
 
 #[cfg(test)]
@@ -18,29 +17,32 @@ mod tests;
 /// Wrapper around a top-level [`Future`] that simplifies polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
-/// Dynamically-sized type which contains the shared state needed to coordinate rescheduling the
-/// task, as well as the task's [`Future`].
+/// Dynamically-sized type which wraps around a [`Future`] and contains shared state that is used to
+/// coordinate rescheduling the task.
 struct TaskInner<F: Future<Output = ()> + Send> {
     /// marks this type as !Unpin
     _pin: PhantomPinned,
 
-    /// state that is used to communicate between wakers and `Task::poll()`
+    /// state that is shared between the wakers and `Task::poll()` to coordinate rescheduling
     shared_state: SharedState,
 
     /* SAFETY:
         This field must only be accessed from within `TaskInner::poll()`.
     */
+    /// the task's [`Future`]
     future: UnsafeCell<F>,
 }
 
-/// State that is shared between `Task::poll` and the wakers, to ensure that whenever `Future::poll`
-/// returns `Pending`, the task is not rescheduled until after `TaskInner::poll` has returned.
+/// State that is shared between `Task::poll` and the wakers, used to ensure that the task is never
+/// rescheduled while it is still being polled.
 struct SharedState {
-    /// monotonic counter for how many times this task has been rescheduled
-    wake_counter: AtomicU64,
+    /// A progress counter that is used to coordinate task rescheduling.
+    /// When the task is polled and returns `Pending`, the counter is incremented by the first waker
+    /// to be invoked. It is incremented again by whichever thread ends up rescheduling the task.
+    progress: AtomicU64,
 
-    /// flag to communicate whether the next waker should reschedule the task
-    should_wake: AtomicBool,
+    /// A flag used to communicate to the wakers whether the task needs to be rescheduled.
+    reschedule: AtomicBool,
 }
 
 impl Task {
@@ -51,15 +53,16 @@ impl Task {
 
         #[cfg(loom)]
         let inner = {
-            let inner: sync::StdArc<dyn AnyTaskInner + 'static> =
-                sync::StdArc::new(TaskInner::new(future));
+            extern crate alloc;
+            use alloc::sync::Arc as StdArc;
+            let inner: StdArc<dyn AnyTaskInner + 'static> = StdArc::new(TaskInner::new(future));
             let inner = Arc::from_std(inner);
 
             /* SAFETY
-                This is safe for the same reason that the implementation of loom::sync::Arc::pin()
-                is safe.
+                I assume that it is safe to pin a new [`loom::sync::Arc`] because the same
+                assumption is made in the implementation of [`loom::sync::Arc::pin()`].
 
-                see:    https://docs.rs/loom/0.6.0/src/loom/sync/arc.rs.html#24
+                see: https://docs.rs/loom/0.6.1/src/loom/sync/arc.rs.html#24
             */
             unsafe { Pin::new_unchecked(inner) }
         };
@@ -67,60 +70,66 @@ impl Task {
         Self(inner)
     }
 
-    /// Polls the task. If the future does not complete, `reschedule_fn` will be invoked sometime
-    /// after `Future::poll()` has returned and will be given a [`Task`] containing the future.
-    /// Returns `true` iff the task has completed.
+    /// Polls the task, returning `true` if and only if it completes.
+    ///  If the task's future returns `Pending` and arranges for a waker to be invoked,
+    /// `reschedule_fn` will be invoked sometime after `Future::poll()` has returned and will be
+    /// given a [`Task`] containing the future.
     pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
         let shared_state = self.0.shared_state();
 
-        // Read the task's wake counter and use it to create a new waker
-        // This is guaranteed to be the only valid waker as any existing wakers were invalidated
-        // when the task was last rescheduled (as the wake counter was incremented).
-        let wake_counter = shared_state.wake_counter.load(Ordering::Acquire);
-        let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), wake_counter);
+        // Use the task's progress counter to create a new waker.
+        // This is guaranteed to be the only waker with this 'progress' value, as the counter was
+        // incremented when the task was last rescheduled.
+        let progress = shared_state.progress.load(Ordering::Acquire);
+        let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), progress);
 
         /* SAFETY:
             This method is the only code that calls `TaskInner::poll`, and cannot be called again
             until the `reschedule_fn` callback is invoked as it consumes the `Task` object.
-            The `Task` object cannot be cloned: the reschedule callback will have the only copy once
-            it is invoked.
-            The shared state is used by the wakers and the remainder of this function to ensure that
-            the reschedule callback is not invoked until this `poll` invocation has returned, and
-            is invoked no more than once per `poll` invocation.
+            The `Task` object cannot be cloned, so the reschedule callback will have the only copy.
+
+            The shared state is used by the following code and all of the task's wakers to ensure
+            that the task is not rescheduled until this function call has completed. Therefore it
+            is guaranteed that the function will not be called on this `TaskInner` instance again by
+            any thread until it has returned.
         */
         let result = unsafe { self.0.as_ref().poll(&waker) };
 
         if result.is_pending() {
-            let waker_invoked = shared_state.wake_counter.load(Ordering::SeqCst) != wake_counter;
+            // set the 'reschedule' flag to communicate that the task must be rescheduled
+            shared_state
+                .reschedule
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .expect("BUG: 'reschedule' was not reset");
+
+            // determine whether a waker has been invoked yet
+            let waker_invoked = match shared_state.progress.load(Ordering::SeqCst) {
+                n if n == progress => false,
+                n if n == progress + 1 => true,
+                n => panic!("BUG: 'progress' has changed from {progress} to {n} during poll"),
+            };
 
             if waker_invoked {
-                // A waker was invoked before poll() had finished. It did not reschedule the task,
-                // but did increment the counter. The task must be rescheduled here instead.
-                reschedule_fn(self);
-            } else {
-                // No wakers have been invoked yet for the most recent poll() invocation.
-                // We must set 'should_wake' so that the next valid waker reschedules the task.
-                shared_state
-                    .should_wake
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                    .expect("BUG: should_wake was not reset");
+                // The task must be rescheduled either by this thread or by the waker.
+                // Both try to increment the counter, whichever one succeeds is responsible for
+                // rescheduling the task.
+                let success = shared_state
+                    .progress
+                    .compare_exchange(
+                        progress + 1,
+                        progress + 2,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok();
+                if success {
+                    shared_state
+                        .reschedule
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .expect("BUG: 'reschedule' was unexpectedly 'false'");
+                    reschedule_fn(self);
+                }
             }
-        } else {
-            // poll() returned Poll::Ready
-            // Even though there should be no valid wakers, increment the counter to invalidate them
-            // just in case.
-            let result = shared_state.wake_counter.compare_exchange(
-                wake_counter,
-                wake_counter + 1,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            );
-            // If result is Ok(), the future did not use the waker we provided, which is expected as
-            // it returned Poll::Ready.
-            // If result is Err() then the future did use the waker, which it wasn't supposed to,
-            // but all that the waker did was increment the counter which is what we were trying to
-            // do anyway.
-            let _ = result;
         }
         result.is_ready()
     }
@@ -129,8 +138,8 @@ impl Task {
 impl<F: Future<Output = ()> + Send> TaskInner<F> {
     fn new(future: F) -> Self {
         let shared_state = SharedState {
-            wake_counter: AtomicU64::new(0),
-            should_wake: AtomicBool::new(false),
+            progress: AtomicU64::new(0),
+            reschedule: AtomicBool::new(false),
         };
         Self {
             _pin: PhantomPinned,
@@ -146,8 +155,8 @@ trait AnyTaskInner: Send + Sync {
     ///
     /// # Safety
     ///
-    /// The caller must guarantee that this function will not be called again by any thread until
-    /// it has returned, even if the waker is invoked before this function returns.
+    /// The caller must guarantee that this function will not be called on this instance again by
+    /// any thread until it has returned, even if the waker is invoked before this function returns.
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()>;
 
     /// Returns a shared reference to the task's shared state.
@@ -167,7 +176,7 @@ unsafe impl<F: Future<Output = ()> + Send> Sync for TaskInner<F> {}
 
 impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()> {
-        // uses the API for loom::cell::UnsafeCell instead of core::cell::UnsafeCell
+        // this is the API of `loom::cell::UnsafeCell`, rather than `core::cell::UnsafeCell`
         self.future.with_mut(|future| {
             /* SAFETY:
                 Because the caller has guaranteed that this function will not be called again by any
@@ -178,9 +187,9 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
             let future = unsafe { &mut *future };
 
             /* SAFETY:
-                Because the type that contains the future is explicitly marked as !Unpin and is
-                accessed here through a `Pin`, it is safe to assume that the future will not be
-                moved. Hence it is safe to create a pinned reference to it.
+                Because the `TaskInner` type that contains the future is explicitly marked as !Unpin
+                and is always accessed through a `Pin<Arc<_>>`, it is guaranteed that the future
+                will not be moved. Therefore it is safe to create a pinned reference to it.
             */
             let future = unsafe { Pin::new_unchecked(future) };
 
@@ -193,12 +202,14 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     }
 }
 
+/// A [`Waker`] that communicates with its [`Task`] to ensure that the task is never rescheduled
+/// until after it has finished being polled.
 #[derive(Clone)]
 struct SmartWaker<WakeFn: Fn(Task) + Send + Clone> {
     task_inner: Pin<Arc<dyn AnyTaskInner>>,
-    /// the value of the task's wake counter when this waker was created
-    wake_counter: u64,
-    /// the closure to invoke when the waker is invoked
+    /// the value of the task's progress counter when this waker was created
+    progress: u64,
+    /// the closure to call when the waker is invoked
     reschedule_fn: WakeFn,
 }
 
@@ -206,11 +217,11 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
     fn new_waker(
         task_inner: Pin<Arc<dyn AnyTaskInner>>,
         reschedule_fn: RescheduleFn,
-        wake_counter: u64,
+        progress: u64,
     ) -> Waker {
         let this = Box::new(Self {
             task_inner,
-            wake_counter,
+            progress,
             reschedule_fn,
         });
 
@@ -242,8 +253,11 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
             Since this function is only called through this type's vtable, it is guaranteed to only
             be called on the `data` pointer of `RawWaker`s that use this type's vtable.
             Since every `RawWaker` that uses this type's vtable has a `data` pointer that was
-            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, we can be sure that we
-            are converting the `data` pointer back into the `Box` it came from.
+            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, this is guaranteed to
+            simply convert the `data` pointer back into the `Box` it came from.
+
+            The pointer is not used again in this function, and the `Box` is converted back into
+            a raw pointer before the function returns, so no double-free can occur.
         */
         let this = unsafe { Box::from_raw(data as *mut Self) };
         let copy = this.clone();
@@ -271,34 +285,52 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
             Since this function is only called through this type's vtable, it is guaranteed to only
             be called on the `data` pointer of `RawWaker`s that use this type's vtable.
             Since every `RawWaker` that uses this type's vtable has a `data` pointer that was
-            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, we can be sure that we
-            are converting the `data` pointer back into the `Box` it came from.
+            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, this is guaranteed to
+            simply convert the `data` pointer back into the `Box` it came from.
+
+            The pointer is not used again in this function, and the `Box` is converted back into
+            a raw pointer before the function returns, so no double-free can occur.
         */
         let this = unsafe { Box::from_raw(data as *mut Self) };
 
         let shared_state = this.task_inner.shared_state();
 
-        // find out whether the next waker to run should reschedule the task
-        let should_wake = shared_state
-            .should_wake
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+        // If we successfully increment the progress counter, this is the "first" valid waker to be
+        // invoked since the task was polled. This means that this waker may be responsible for
+        // rescheduling the task.
+        let first_waker = shared_state
+            .progress
+            .compare_exchange(
+                this.progress,
+                this.progress + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok();
 
-        // find out if any other valid waker has already been invoked before this one
-        let other_waker_invoked = shared_state
-            .wake_counter
-            .compare_exchange(
-                this.wake_counter,
-                this.wake_counter + 1,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            )
-            .is_err();
+        // if `reschedule` is true, the task has finished being polled and now must be rescheduled
+        // either by this waker or by the thread that polled the task.
+        let reschedule = shared_state.reschedule.load(Ordering::SeqCst);
 
-        // if we successfully set should_wake to false and incremented wake_counter,
-        // this is the waker that must reschedule the task
-        if should_wake && !other_waker_invoked {
-            (this.reschedule_fn)(Task(this.task_inner.clone()));
+        if first_waker && reschedule {
+            // This waker and the thread that polled the task both attempt to increment the counter.
+            // Whichever succeeds is responsible for rescheduling the task.
+            let success = shared_state
+                .progress
+                .compare_exchange(
+                    this.progress + 1,
+                    this.progress + 2,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok();
+            if success {
+                shared_state
+                    .reschedule
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .expect("BUG: 'reschedule' was unexpectedly 'false'");
+                (this.reschedule_fn)(Task(this.task_inner.clone()));
+            }
         }
 
         /* SAFETY:
@@ -314,8 +346,10 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
             Since this function is only called through this type's vtable, it is guaranteed to only
             be called on the `data` pointer of `RawWaker`s that use this type's vtable.
             Since every `RawWaker` that uses this type's vtable has a `data` pointer that was
-            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, we can be sure that we
-            are converting the `data` pointer back into the `Box` it came from.
+            created by calling `Box::<SmartWaker<RescheduleFn>>::into_raw()`, this is guaranteed to
+            simply convert the `data` pointer back into the `Box` it came from.
+
+            The raw pointer is not used again and the `Box` is dropped, so no double-free can occur.
         */
         let this = unsafe { Box::from_raw(data as *mut Self) };
         drop(this);
