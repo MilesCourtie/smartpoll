@@ -72,6 +72,7 @@ fn test_2() {
     impl Future for Fut {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            println!("polls_remaining: {}", self.polls_remaining);
             if self.polls_remaining > 0 {
                 self.polls_remaining -= 1;
                 self.waker_tx
@@ -90,21 +91,24 @@ fn test_2() {
         let reschedule_fn = {
             let task_tx = task_tx.clone();
             move |task| {
+                println!("rescheduling...");
                 task_tx.send(task).expect("channel disconnected");
             }
         };
 
         let (waker_tx, waker_rx) = channel::<Waker>();
 
-        let _waker_thread = thread::spawn(move || {
+        let waker_thread = thread::spawn(move || {
             while let Ok(waker) = waker_rx.recv() {
                 waker.wake();
             }
+            println!("exiting waker thread");
         });
 
-        let task = Task::new(Fut::new(3, waker_tx));
+        let task = Task::new(Fut::new(3, waker_tx.clone()));
 
         task_tx.send(task).expect("channel disconnected");
+        drop(task_tx);
 
         loop {
             match task_rx.recv() {
@@ -118,6 +122,11 @@ fn test_2() {
                 }
             }
         }
+
+        println!("joining waker thread");
+        waker_thread.join().unwrap();
+
+        // see: https://github.com/tokio-rs/loom/issues/213
     }
 
     loom::model(test_body);
