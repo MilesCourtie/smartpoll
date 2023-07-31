@@ -97,9 +97,36 @@ impl Task {
         let shared_state = self.0.shared_state();
 
         // Use the task's progress counter to create a new waker.
-        // This is guaranteed to be the only waker with this 'progress' value, as the counter was
+        // This is guaranteed to be the only waker with this `progress` value, as the counter was
         // incremented when the task was last rescheduled.
         let progress = shared_state.progress.load(Ordering::SeqCst);
+
+        /*
+        drop(shared_state);
+
+        // every 2^16 polls (i.e. every 2^18 increments) reset `progress` to zero, if there are no
+        // wakers, to stop it from overflowing
+        self.0 = if progress & 0x3ffff == 0 {
+            /* SAFETY
+                It is safe to remove the Pin from the Arc as the pinning invariants are upheld
+                until the Pin is added again. The shared_state is modified but nothing is moved.
+            */
+            let mut task_inner = unsafe { Pin::into_inner_unchecked(self.0) };
+            if let Some(task_inner) = Arc::<_>::get_mut(&mut task_inner) {
+                // if there are no wakers
+                let progress = task_inner.shared_state_mut().progress.get_mut();
+                *progress = 0;
+            }
+            /* SAFETY
+                This is safe as we are simply re-pinning the Arc that was just unpinned.
+            */
+            unsafe { Pin::new_unchecked(task_inner) }
+        } else {
+            self.0
+        };
+        */
+
+        // create a waker using the value of `shared_state.progress`
         let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), progress);
 
         /* SAFETY:
@@ -115,39 +142,28 @@ impl Task {
         let result = unsafe { self.0.as_ref().poll(&waker) };
 
         if result.is_pending() {
-            // set the 'reschedule' flag to communicate that the task must be rescheduled
-            shared_state
-                .reschedule
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .expect("BUG: 'reschedule' was not reset");
-
-            // determine whether a waker has been invoked yet
-            let waker_invoked = match shared_state.progress.load(Ordering::SeqCst) {
+            let _waker_invoked = match shared_state.progress.fetch_add(2, Ordering::SeqCst) {
                 n if n == progress => false,
                 n if n == progress + 1 => true,
-                n => panic!("BUG: 'progress' has changed from {progress} to {n} during poll"),
+                n => panic!("BUG: 'progress' was unexpectedly set to {n} during poll"),
             };
 
-            if waker_invoked {
-                // The task must be rescheduled either by this thread or by the waker.
-                // Both try to increment the counter, whichever one succeeds is responsible for
-                // rescheduling the task.
-                let success = shared_state
-                    .progress
-                    .compare_exchange(
-                        progress + 1,
-                        progress + 2,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_ok();
-                if success {
-                    shared_state
-                        .reschedule
-                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                        .expect("BUG: 'reschedule' was unexpectedly 'false'");
-                    reschedule_fn(self);
-                }
+            println!("task: waker_invoked: {_waker_invoked}");
+
+            let permission_to_reschedule = shared_state
+                .progress
+                .compare_exchange(
+                    progress + 3,
+                    progress + 4,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok();
+
+            println!("task: permission_to_reschedule: {permission_to_reschedule}");
+
+            if permission_to_reschedule {
+                reschedule_fn(self);
             }
         }
         result.is_ready()
@@ -157,8 +173,7 @@ impl Task {
 impl<F: Future<Output = ()> + Send> TaskInner<F> {
     fn new(future: F) -> Self {
         let shared_state = SharedState {
-            progress: AtomicU64::new(0),
-            reschedule: AtomicBool::new(false),
+            progress: AtomicUsize::new(0),
         };
         Self {
             _pin: PhantomPinned,
@@ -180,6 +195,9 @@ trait AnyTaskInner: Send + Sync {
 
     /// Returns a shared reference to the task's shared state.
     fn shared_state(&self) -> &SharedState;
+
+    /// Returns a mutable reference to the task's shared state.
+    fn shared_state_mut(&mut self) -> &mut SharedState;
 }
 
 /* SAFETY:
@@ -219,6 +237,10 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     fn shared_state(&self) -> &SharedState {
         &self.shared_state
     }
+
+    fn shared_state_mut(&mut self) -> &mut SharedState {
+        &mut self.shared_state
+    }
 }
 
 /// A [`Waker`] that communicates with its [`Task`] to ensure that the task is never rescheduled
@@ -227,7 +249,7 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
 struct SmartWaker<WakeFn: Fn(Task) + Send + Clone> {
     task_inner: Pin<Arc<dyn AnyTaskInner>>,
     /// the value of the task's progress counter when this waker was created
-    progress: u64,
+    progress: usize,
     /// the closure to call when the waker is invoked
     reschedule_fn: WakeFn,
 }
@@ -236,7 +258,7 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
     fn new_waker(
         task_inner: Pin<Arc<dyn AnyTaskInner>>,
         reschedule_fn: RescheduleFn,
-        progress: u64,
+        progress: usize,
     ) -> Waker {
         let this = Box::new(Self {
             task_inner,
@@ -314,40 +336,54 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
 
         let shared_state = this.task_inner.shared_state();
 
-        // If we successfully increment the progress counter, this is the "first" valid waker to be
-        // invoked since the task was polled. This means that this waker may be responsible for
-        // rescheduling the task.
-        let first_waker = shared_state
-            .progress
-            .compare_exchange(
-                this.progress,
-                this.progress + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok();
+        // If we successfully increment the progress counter to this.progress+1, this is the "first"
+        // valid waker to be invoked since the task was polled. From the old value of the counter we
+        // can also learn whether the task has finished being polled.
+        let (mut first_waker, poll_completed) = match shared_state.progress.compare_exchange(
+            this.progress,
+            this.progress + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(n) if n == this.progress => (true, false),
+            Err(n) if n == this.progress + 1 => (false, false),
+            Err(n) if n == this.progress + 2 => (true, true),
+            Err(n) if n == this.progress + 3 => (false, true),
+            Err(n) => panic!("BUG: shared_state.progress was unexpectedly {n}"),
+            Ok(_) => unreachable!(),
+        };
 
-        // if `reschedule` is true, the task has finished being polled and now must be rescheduled
-        // either by this waker or by the thread that polled the task.
-        let reschedule = shared_state.reschedule.load(Ordering::SeqCst);
+        println!("waker: first_waker: {first_waker}");
+        println!("waker: poll_completed: {poll_completed}");
 
-        if first_waker && reschedule {
-            // This waker and the thread that polled the task both attempt to increment the counter.
-            // Whichever succeeds is responsible for rescheduling the task.
-            let success = shared_state
+        if first_waker && poll_completed {
+            first_waker = shared_state
                 .progress
                 .compare_exchange(
-                    this.progress + 1,
                     this.progress + 2,
+                    this.progress + 3,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
                 .is_ok();
-            if success {
-                shared_state
-                    .reschedule
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .expect("BUG: 'reschedule' was unexpectedly 'false'");
+        }
+
+        println!("waker: first_waker: {first_waker}");
+
+        if first_waker {
+            let permission_to_reschedule = shared_state
+                .progress
+                .compare_exchange(
+                    this.progress + 3,
+                    this.progress + 4,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok();
+
+            println!("waker: permission_to_reschedule: {permission_to_reschedule}");
+
+            if permission_to_reschedule {
                 (this.reschedule_fn)(Task(this.task_inner.clone()));
             }
         }
