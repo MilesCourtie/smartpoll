@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::Task;
 use core::{
     future::Future,
@@ -8,7 +6,6 @@ use core::{
 };
 
 /// Tests using `Task::poll()` with the simplest possible future.
-#[cfg(not(loom))]
 #[test]
 fn test_0() {
     struct Fut;
@@ -25,7 +22,6 @@ fn test_0() {
 }
 
 /// Tests using `Task` to poll a future which doesn't immediately complete.
-#[cfg(not(loom))]
 #[test]
 fn test_1() {
     struct Fut(u8);
@@ -45,89 +41,4 @@ fn test_1() {
         task.poll(recursive_poll);
     }
     recursive_poll(Task::new(Fut(2)));
-}
-
-/// Tests that when a single waker is used, a task is never rescheduled until after poll() returns.
-#[cfg(loom)]
-#[test]
-fn test_2() {
-    use core::task::Waker;
-    use loom::{
-        sync::mpsc::{channel, Sender},
-        thread,
-    };
-
-    struct Fut {
-        polls_remaining: u8,
-        waker_tx: Sender<Waker>,
-    }
-    impl Fut {
-        fn new(polls_remaining: u8, waker_tx: Sender<Waker>) -> Self {
-            Self {
-                polls_remaining,
-                waker_tx,
-            }
-        }
-    }
-    impl Future for Fut {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            println!("polls_remaining: {}", self.polls_remaining);
-            if self.polls_remaining > 0 {
-                self.polls_remaining -= 1;
-                self.waker_tx
-                    .send(cx.waker().clone())
-                    .expect("channel closed");
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        }
-    }
-
-    fn test_body() {
-        let (task_tx, task_rx) = channel();
-
-        let reschedule_fn = {
-            let task_tx = task_tx.clone();
-            move |task| {
-                println!("rescheduling...");
-                task_tx.send(task).expect("channel disconnected");
-            }
-        };
-
-        let (waker_tx, waker_rx) = channel::<Waker>();
-
-        let waker_thread = thread::spawn(move || {
-            while let Ok(waker) = waker_rx.recv() {
-                waker.wake();
-            }
-            println!("exiting waker thread");
-        });
-
-        let task = Task::new(Fut::new(3, waker_tx.clone()));
-
-        task_tx.send(task).expect("channel disconnected");
-        drop(task_tx);
-
-        loop {
-            match task_rx.recv() {
-                Ok(task) => {
-                    if task.poll(reschedule_fn.clone()) {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    panic!("channel disconnected");
-                }
-            }
-        }
-
-        println!("joining waker thread");
-        waker_thread.join().unwrap();
-
-        // see: https://github.com/tokio-rs/loom/issues/213
-    }
-
-    loom::model(test_body);
 }

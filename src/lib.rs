@@ -1,21 +1,19 @@
 use core::{
+    cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-
-mod sync;
-use sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, UnsafeCell,
-};
+extern crate alloc;
+use alloc::sync::Arc;
 
 #[cfg(test)]
 mod tests;
 
 /// Wrapper around a top-level [`Future`] that simplifies polling it.
-pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
+pub struct Task(Option<Pin<Arc<dyn AnyTaskInner>>>);
 
 /// Dynamically-sized type which wraps around a [`Future`] and contains shared state that is used to
 /// coordinate rescheduling the task.
@@ -67,67 +65,43 @@ struct SharedState {
 impl Task {
     /// Converts the provided [`Future`] into a [`Task`].
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
-        #[cfg(not(loom))]
-        let inner = Arc::pin(TaskInner::new(future));
-
-        #[cfg(loom)]
-        let inner = {
-            extern crate alloc;
-            use alloc::sync::Arc as StdArc;
-            let inner: StdArc<dyn AnyTaskInner + 'static> = StdArc::new(TaskInner::new(future));
-            let inner = Arc::from_std(inner);
-
-            /* SAFETY
-                I assume that it is safe to pin a new [`loom::sync::Arc`] because the same
-                assumption is made in the implementation of [`loom::sync::Arc::pin()`].
-
-                see: https://docs.rs/loom/0.6.1/src/loom/sync/arc.rs.html#24
-            */
-            unsafe { Pin::new_unchecked(inner) }
-        };
-
-        Self(inner)
+        Self(Some(Arc::pin(TaskInner::new(future))))
     }
 
     /// Polls the task, returning `true` if and only if it completes.
     ///  If the task's future returns `Pending` and arranges for a waker to be invoked,
     /// `reschedule_fn` will be invoked sometime after `Future::poll()` has returned and will be
     /// given a [`Task`] containing the future.
-    pub fn poll(self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
-        let shared_state = self.0.shared_state();
-
+    pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
         // Use the task's progress counter to create a new waker.
         // This is guaranteed to be the only waker with this `progress` value, as the counter was
         // incremented when the task was last rescheduled.
+        let shared_state = self.0.as_ref().unwrap().shared_state();
         let progress = shared_state.progress.load(Ordering::SeqCst);
-
-        /*
-        drop(shared_state);
 
         // every 2^16 polls (i.e. every 2^18 increments) reset `progress` to zero, if there are no
         // wakers, to stop it from overflowing
-        self.0 = if progress & 0x3ffff == 0 {
-            /* SAFETY
-                It is safe to remove the Pin from the Arc as the pinning invariants are upheld
-                until the Pin is added again. The shared_state is modified but nothing is moved.
+        let task_inner = self.0.take().unwrap();
+        self.0 = Some(if progress & 0x3ffff == 0 {
+            /* SAFETY:
+                We remove the Pin from the Arc and immediately put it back after attempting to
+                reset the counter. Regardless of whether the counter is reset or not, no data is
+                moved so the pinning contract is not violated.
             */
-            let mut task_inner = unsafe { Pin::into_inner_unchecked(self.0) };
-            if let Some(task_inner) = Arc::<_>::get_mut(&mut task_inner) {
-                // if there are no wakers
-                let progress = task_inner.shared_state_mut().progress.get_mut();
-                *progress = 0;
+            let mut task_inner = unsafe { Pin::into_inner_unchecked(task_inner) };
+            if let Some(inner) = Arc::get_mut(&mut task_inner) {
+                *inner.shared_state_mut().progress.get_mut() = 0;
             }
-            /* SAFETY
-                This is safe as we are simply re-pinning the Arc that was just unpinned.
-            */
             unsafe { Pin::new_unchecked(task_inner) }
         } else {
-            self.0
-        };
-        */
+            task_inner
+        });
+
+        let task_inner = self.0.as_ref().unwrap();
+        let shared_state = task_inner.shared_state();
 
         // create a waker using the value of `shared_state.progress`
-        let waker = SmartWaker::new_waker(self.0.clone(), reschedule_fn.clone(), progress);
+        let waker = SmartWaker::new_waker(task_inner.clone(), reschedule_fn.clone(), progress);
 
         /* SAFETY:
             This method is the only code that calls `TaskInner::poll`, and cannot be called again
@@ -139,7 +113,7 @@ impl Task {
             is guaranteed that the function will not be called on this `TaskInner` instance again by
             any thread until it has returned.
         */
-        let result = unsafe { self.0.as_ref().poll(&waker) };
+        let result = unsafe { task_inner.as_ref().poll(&waker) };
 
         if result.is_pending() {
             let _waker_invoked = match shared_state.progress.fetch_add(2, Ordering::SeqCst) {
@@ -147,8 +121,6 @@ impl Task {
                 n if n == progress + 1 => true,
                 n => panic!("BUG: 'progress' was unexpectedly set to {n} during poll"),
             };
-
-            println!("task: waker_invoked: {_waker_invoked}");
 
             let permission_to_reschedule = shared_state
                 .progress
@@ -159,8 +131,6 @@ impl Task {
                     Ordering::SeqCst,
                 )
                 .is_ok();
-
-            println!("task: permission_to_reschedule: {permission_to_reschedule}");
 
             if permission_to_reschedule {
                 reschedule_fn(self);
@@ -213,25 +183,24 @@ unsafe impl<F: Future<Output = ()> + Send> Sync for TaskInner<F> {}
 
 impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()> {
-        // this is the API of `loom::cell::UnsafeCell`, rather than `core::cell::UnsafeCell`
-        self.future.with_mut(|future| {
-            /* SAFETY:
-                Because the caller has guaranteed that this function will not be called again by any
-                thread until it has returned, and because no other code accesses the UnsafeCell, it
-                is safe to assume that this function has exclusive access to the future in the
-                UnsafeCell.
-            */
-            let future = unsafe { &mut *future };
+        let future = self.future.get();
 
-            /* SAFETY:
-                Because the `TaskInner` type that contains the future is explicitly marked as !Unpin
-                and is always accessed through a `Pin<Arc<_>>`, it is guaranteed that the future
-                will not be moved. Therefore it is safe to create a pinned reference to it.
-            */
-            let future = unsafe { Pin::new_unchecked(future) };
+        /* SAFETY:
+            Because the caller has guaranteed that this function will not be called again by any
+            thread until it has returned, and because no other code accesses the UnsafeCell, it
+            is safe to assume that this function has exclusive access to the future in the
+            UnsafeCell.
+        */
+        let future = unsafe { &mut *future };
 
-            future.poll(&mut Context::from_waker(waker))
-        })
+        /* SAFETY:
+            Because the `TaskInner` type that contains the future is explicitly marked as !Unpin
+            and is always accessed through a `Pin<Arc<_>>`, it is guaranteed that the future
+            will not be moved. Therefore it is safe to create a pinned reference to it.
+        */
+        let future = unsafe { Pin::new_unchecked(future) };
+
+        future.poll(&mut Context::from_waker(waker))
     }
 
     fn shared_state(&self) -> &SharedState {
@@ -353,9 +322,6 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
             Ok(_) => unreachable!(),
         };
 
-        println!("waker: first_waker: {first_waker}");
-        println!("waker: poll_completed: {poll_completed}");
-
         if first_waker && poll_completed {
             first_waker = shared_state
                 .progress
@@ -368,8 +334,6 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
                 .is_ok();
         }
 
-        println!("waker: first_waker: {first_waker}");
-
         if first_waker {
             let permission_to_reschedule = shared_state
                 .progress
@@ -381,10 +345,8 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
                 )
                 .is_ok();
 
-            println!("waker: permission_to_reschedule: {permission_to_reschedule}");
-
             if permission_to_reschedule {
-                (this.reschedule_fn)(Task(this.task_inner.clone()));
+                (this.reschedule_fn)(Task(Some(this.task_inner.clone())));
             }
         }
 

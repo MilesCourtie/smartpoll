@@ -9,6 +9,3 @@ homepage = "https://github.com/MilesCourtie/smartpoll"
 repository = "https://github.com/MilesCourtie/smartpoll"
 categories = ["asynchronous"]
 keywords = ["async", "executor", "futures", "task"]
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.6"
