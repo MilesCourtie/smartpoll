@@ -3,7 +3,7 @@ use core::{
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::AtomicUsize,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 extern crate alloc;
@@ -12,8 +12,11 @@ use alloc::sync::Arc;
 #[cfg(test)]
 mod tests;
 
+// the synchronisation algorithm is broken into small steps for testing purposes
+mod steps;
+
 /// Wrapper around a top-level [`Future`] that simplifies polling it.
-pub struct Task(Option<Pin<Arc<dyn AnyTaskInner>>>);
+pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
 /// Dynamically-sized type which wraps around a [`Future`] and contains shared state that is used to
 /// coordinate rescheduling the task.
@@ -34,38 +37,14 @@ struct TaskInner<F: Future<Output = ()> + Send> {
 /// State that is shared between `Task::poll` and the wakers, used to ensure that the task is never
 /// rescheduled while it is still being polled.
 struct SharedState {
-    /// A progress counter that is used to coordinate task rescheduling.
-    /// Each time the task goes through the cycle of being polled and rescheduled, the counter
-    /// is incremented by 4. The process is as follows:
-    ///  1. Initially the counter is equal to 4N, where N is a non-negative integer. A waker is
-    ///     created that stores the number 4N so that it can check it is still valid when invoked.
-    ///  2. The future is polled and does not complete, so arranges for the waker to be invoked.
-    ///     It may create multiple copies of the waker and arrange for many of them to be invoked.
-    ///  3. If a waker is invoked while the future is still being polled, it sets the counter to
-    ///     4N+1 iff its value is 4N. If this fails, another waker was invoked so this one halts.
-    ///  4. Once `Task::poll` has finished polling the future, it increments the counter by 2,
-    ///     noting the value it is replacing. Iff the value was 4N+1 it knows a waker has been
-    ///     invoked, otherwise it halts as there is nothing left to do until a waker is invoked.
-    ///  5. If a waker is invoked while the counter is 4N+2 or 4N+3, it will try to increment the
-    ///     counter to 4N+1 but fail as the value isn't 4N. The waker will know from the counter's
-    ///     value that (a) the task has finished being polled, and (b) whether another waker has
-    ///     already been invoked.
-    ///  6. The waker that incremented the counter and `Task::poll` (if it didn't halt in step 4)
-    ///     try to increase the counter to 4N+4 using `compare_exchange`.
-    ///     Whichever one succeeds then reschedules the task, and the counter is equal to 4(N+1).
-    ///
-    /// N.B.
-    ///  *1 Initially the counter is 0, and occasionally it is reset to 0 before step 1, if there
-    ///     are no wakers, to prevent it from overflowing.
-    ///  *2 If the future completes in step 2, the counter is set to 4N+4 by `Task::poll` and is not
-    ///     modified again as a result.
+    /// a progress counter that is used to coordinate task rescheduling
     progress: AtomicUsize,
 }
 
 impl Task {
     /// Converts the provided [`Future`] into a [`Task`].
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self(Some(Arc::pin(TaskInner::new(future))))
+        Self(Arc::pin(TaskInner::new(future)))
     }
 
     /// Polls the task, returning `true` if and only if it completes.
@@ -73,35 +52,24 @@ impl Task {
     /// `reschedule_fn` will be invoked sometime after `Future::poll()` has returned and will be
     /// given a [`Task`] containing the future.
     pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
+        use steps::task as steps;
+
         // Use the task's progress counter to create a new waker.
         // This is guaranteed to be the only waker with this `progress` value, as the counter was
         // incremented when the task was last rescheduled.
-        let shared_state = self.0.as_ref().unwrap().shared_state();
-        let progress = shared_state.progress.load(Ordering::SeqCst);
+        let progress = steps::get_progress(&mut self.0);
 
-        // every 2^16 polls (i.e. every 2^18 increments) reset `progress` to zero, if there are no
-        // wakers, to stop it from overflowing
-        let task_inner = self.0.take().unwrap();
-        self.0 = Some(if progress & 0x3ffff == 0 {
-            /* SAFETY:
-                We remove the Pin from the Arc and immediately put it back after attempting to
-                reset the counter. Regardless of whether the counter is reset or not, no data is
-                moved so the pinning contract is not violated.
-            */
-            let mut task_inner = unsafe { Pin::into_inner_unchecked(task_inner) };
-            if let Some(inner) = Arc::get_mut(&mut task_inner) {
-                *inner.shared_state_mut().progress.get_mut() = 0;
-            }
-            unsafe { Pin::new_unchecked(task_inner) }
+        // every 2^16 polls (i.e. every 2^18 increments) try to reset `progress` to zero to stop
+        // it from overflowing. This will only succeed if there aren't any wakers left over from
+        // previous polls of this task.
+        let inner = if progress & 0x3ffff == 0 {
+            steps::try_reset_progress(self.0)
         } else {
-            task_inner
-        });
-
-        let task_inner = self.0.as_ref().unwrap();
-        let shared_state = task_inner.shared_state();
+            self.0
+        };
 
         // create a waker using the value of `shared_state.progress`
-        let waker = SmartWaker::new_waker(task_inner.clone(), reschedule_fn.clone(), progress);
+        let waker = SmartWaker::new_waker(inner.clone(), reschedule_fn.clone(), progress);
 
         /* SAFETY:
             This method is the only code that calls `TaskInner::poll`, and cannot be called again
@@ -113,29 +81,23 @@ impl Task {
             is guaranteed that the function will not be called on this `TaskInner` instance again by
             any thread until it has returned.
         */
-        let result = unsafe { task_inner.as_ref().poll(&waker) };
+        let result = unsafe { inner.as_ref().poll(&waker) };
 
         if result.is_pending() {
-            let _waker_invoked = match shared_state.progress.fetch_add(2, Ordering::SeqCst) {
-                n if n == progress => false,
-                n if n == progress + 1 => true,
-                n => panic!("BUG: 'progress' was unexpectedly set to {n} during poll"),
-            };
+            let shared_state = inner.shared_state();
 
-            let permission_to_reschedule = shared_state
-                .progress
-                .compare_exchange(
-                    progress + 3,
-                    progress + 4,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok();
+            let waker_invoked = steps::was_waker_invoked(progress, shared_state);
 
-            if permission_to_reschedule {
-                reschedule_fn(self);
+            if waker_invoked {
+                let permission_to_reschedule = steps::attempt_reschedule(progress, shared_state);
+                if permission_to_reschedule {
+                    reschedule_fn(Self(inner));
+                }
             }
+        } else {
+            steps::completed(progress, inner.shared_state());
         }
+
         result.is_ready()
     }
 }
@@ -291,6 +253,8 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
     /// The `wake_by_ref` function for this type's `RawWakerVTable`.
     /// Wakes the future without consuming the waker.
     unsafe fn wake_by_ref(data: *const ()) {
+        use steps::waker as steps;
+
         /* SAFETY:
             Since this function is only called through this type's vtable, it is guaranteed to only
             be called on the `data` pointer of `RawWaker`s that use this type's vtable.
@@ -308,45 +272,12 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         // If we successfully increment the progress counter to this.progress+1, this is the "first"
         // valid waker to be invoked since the task was polled. From the old value of the counter we
         // can also learn whether the task has finished being polled.
-        let (mut first_waker, poll_completed) = match shared_state.progress.compare_exchange(
-            this.progress,
-            this.progress + 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(n) if n == this.progress => (true, false),
-            Err(n) if n == this.progress + 1 => (false, false),
-            Err(n) if n == this.progress + 2 => (true, true),
-            Err(n) if n == this.progress + 3 => (false, true),
-            Err(n) => panic!("BUG: shared_state.progress was unexpectedly {n}"),
-            Ok(_) => unreachable!(),
-        };
+        let (first_waker, poll_completed) = steps::on_wake(this.progress, shared_state);
 
         if first_waker && poll_completed {
-            first_waker = shared_state
-                .progress
-                .compare_exchange(
-                    this.progress + 2,
-                    this.progress + 3,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok();
-        }
-
-        if first_waker {
-            let permission_to_reschedule = shared_state
-                .progress
-                .compare_exchange(
-                    this.progress + 3,
-                    this.progress + 4,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok();
-
+            let permission_to_reschedule = steps::attempt_reschedule(this.progress, shared_state);
             if permission_to_reschedule {
-                (this.reschedule_fn)(Task(Some(this.task_inner.clone())));
+                (this.reschedule_fn)(Task(this.task_inner.clone()));
             }
         }
 
