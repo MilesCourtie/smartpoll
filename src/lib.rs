@@ -12,8 +12,7 @@ use alloc::sync::Arc;
 #[cfg(test)]
 mod tests;
 
-// the synchronisation algorithm is broken into small steps for testing purposes
-mod steps;
+mod algorithm;
 
 /// Wrapper around a top-level [`Future`] that simplifies polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
@@ -52,7 +51,7 @@ impl Task {
     /// `reschedule_fn` will be invoked sometime after `Future::poll()` has returned and will be
     /// given a [`Task`] containing the future.
     pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> bool {
-        use steps::task as steps;
+        use algorithm::task as steps;
 
         // Use the task's progress counter to create a new waker.
         // This is guaranteed to be the only waker with this `progress` value, as the counter was
@@ -253,7 +252,7 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
     /// The `wake_by_ref` function for this type's `RawWakerVTable`.
     /// Wakes the future without consuming the waker.
     unsafe fn wake_by_ref(data: *const ()) {
-        use steps::waker as steps;
+        use algorithm::waker as steps;
 
         /* SAFETY:
             Since this function is only called through this type's vtable, it is guaranteed to only
