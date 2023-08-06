@@ -1,16 +1,19 @@
 //! TODO document this module
 
 pub(crate) mod task {
-    use crate::{AnyTaskInner, SharedState};
-    use core::{pin::Pin, sync::atomic::Ordering};
+    use crate::AnyTaskInner;
+    use core::{
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     extern crate alloc;
     use alloc::sync::Arc;
 
-    pub(crate) fn get_progress(task_inner: &mut Pin<Arc<dyn AnyTaskInner>>) -> usize {
-        task_inner.shared_state().progress.load(Ordering::SeqCst)
+    pub(crate) fn get_counter(task_inner: &mut Pin<Arc<dyn AnyTaskInner>>) -> usize {
+        task_inner.counter().load(Ordering::SeqCst)
     }
 
-    pub(crate) fn try_reset_progress(
+    pub(crate) fn try_reset_counter(
         task_inner: Pin<Arc<dyn AnyTaskInner>>,
     ) -> Pin<Arc<dyn AnyTaskInner>> {
         /* SAFETY:
@@ -20,93 +23,74 @@ pub(crate) mod task {
         */
         let mut task_inner = unsafe { Pin::into_inner_unchecked(task_inner) };
         if let Some(inner) = Arc::get_mut(&mut task_inner) {
-            *inner.shared_state_mut().progress.get_mut() = 0;
+            *inner.counter_mut().get_mut() = 0;
         }
         unsafe { Pin::new_unchecked(task_inner) }
     }
 
-    pub(crate) fn was_waker_invoked(progress: usize, shared_state: &SharedState) -> bool {
-        match shared_state.progress.fetch_add(2, Ordering::SeqCst) {
-            n if n == progress => false,
-            n if n == progress + 1 => true,
+    pub(crate) fn was_waker_invoked(start: usize, counter: &AtomicUsize) -> bool {
+        match counter.fetch_add(2, Ordering::SeqCst) {
+            n if n == start => false,
+            n if n == start + 1 => true,
             n => panic!(
-                "BUG: `progress` was unexpectedly {n} after poll \
+                "BUG: counter was unexpectedly {n} after poll \
                 (expected {} or {})",
-                progress,
-                progress + 1,
+                start,
+                start + 1,
             ),
         }
     }
 
-    pub(crate) fn attempt_reschedule(progress: usize, shared_state: &SharedState) -> bool {
-        match shared_state.progress.compare_exchange(
-            progress + 3,
-            progress + 4,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+    pub(crate) fn attempt_reschedule(start: usize, counter: &AtomicUsize) -> bool {
+        match counter.compare_exchange(start + 3, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => true,
-            Err(n) if n == progress + 4 => false,
+            Err(n) if n == start + 4 => false,
             Err(n) => panic!(
-                "BUG: `progress` was unexpectedly {n} when task tried to reschedule \
+                "BUG: counter was unexpectedly {n} when task tried to reschedule \
                 (expected {})",
-                progress + 3
+                start + 3
             ),
         }
     }
 
-    pub(crate) fn completed(progress: usize, shared_state: &SharedState) {
-        let result = shared_state.progress.compare_exchange(
-            progress,
-            progress + 4,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+    pub(crate) fn completed(start: usize, counter: &AtomicUsize) {
+        let result = counter.compare_exchange(start, start + 4, Ordering::SeqCst, Ordering::SeqCst);
         // TODO explain why it is okay to ignore the result
         let _ = result;
     }
 }
 
 pub(crate) mod waker {
-    use crate::SharedState;
+    use crate::AtomicUsize;
     use core::sync::atomic::Ordering;
 
-    pub(crate) fn on_wake(progress: usize, shared_state: &SharedState) -> (bool, bool) {
-        let (first_waker, poll_completed) = match shared_state.progress.compare_exchange(
-            progress,
-            progress + 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => (true, false),
-            Err(n) if n == progress + 1 => (false, false),
-            Err(n) if n == progress + 2 => (true, true),
-            Err(n) if n == progress + 3 => (false, true),
-            Err(n) => panic!(
-                "BUG: `progress` was unexpectedly {n} when waker was invoked \
+    pub(crate) fn on_wake(start: usize, counter: &AtomicUsize) -> (bool, bool) {
+        let (first_waker, poll_completed) =
+            match counter.compare_exchange(start, start + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => (true, false),
+                Err(n) if n == start + 1 => (false, false),
+                Err(n) if n == start + 2 => (true, true),
+                Err(n) if n == start + 3 => (false, true),
+                Err(n) => panic!(
+                    "BUG: counter was unexpectedly {n} when waker was invoked \
                 (expected {}, {}, {}, or {})",
-                progress,
-                progress + 1,
-                progress + 2,
-                progress + 3,
-            ),
-        };
+                    start,
+                    start + 1,
+                    start + 2,
+                    start + 3,
+                ),
+            };
         (first_waker, poll_completed)
     }
 
-    pub(crate) fn attempt_reschedule(progress: usize, shared_state: &SharedState) -> bool {
-        match shared_state.progress.compare_exchange(
-            progress + 3,
-            progress + 4,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+    pub(crate) fn attempt_reschedule(start: usize, counter: &AtomicUsize) -> bool {
+        match counter.compare_exchange(start + 3, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => true,
-            Err(n) if n == progress + 4 => false,
+            Err(n) if n == start + 4 => false,
             Err(n) => panic!(
-                "BUG: `progress` was unexpectedly {n} when waker tried to reschedule \
+                "BUG: counter was unexpectedly {n} when waker tried to reschedule \
                 (expected {})",
-                progress + 3
+                start + 3
             ),
         }
     }
