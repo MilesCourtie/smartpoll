@@ -71,20 +71,13 @@ pub(crate) mod waker {
                 Err(n) if n == start + 1 => (false, false),
                 Err(n) if n == start + 2 => (true, true),
                 Err(n) if n == start + 3 => (false, true),
-                Err(n) => panic!(
-                    "BUG: counter was unexpectedly {n} when waker was invoked \
-                (expected {}, {}, {}, or {})",
-                    start,
-                    start + 1,
-                    start + 2,
-                    start + 3,
-                ),
+                Err(_) => (false, false), // waker is outdated
             };
         (first_waker, poll_completed)
     }
 
     pub(crate) fn attempt_reschedule(start: usize, counter: &AtomicUsize) -> bool {
-        match counter.compare_exchange(start + 3, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
+        match counter.compare_exchange(start + 2, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => true,
             Err(n) if n == start + 4 => false,
             Err(n) => panic!(

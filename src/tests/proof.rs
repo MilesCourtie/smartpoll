@@ -8,7 +8,7 @@ use alloc::rc::Rc;
 
 #[test]
 #[allow(dead_code)]
-fn permute_steps() {
+fn exhaustive_proof_2_wakers() {
     async fn new_task_thread(start: usize, counter: Rc<AtomicUsize>) {
         use algorithm::task as steps;
         let counter = counter.as_ref();
@@ -19,10 +19,9 @@ fn permute_steps() {
         if waker_invoked {
             let permission_to_reschedule = steps::attempt_reschedule(start, counter);
             if permission_to_reschedule {
-                println!("task thread has permission to reschedule");
+                println!("  task thread has permission to reschedule");
             }
         }
-        println!("task thread complete");
     }
 
     async fn new_waker_thread(start: usize, counter: Rc<AtomicUsize>) {
@@ -35,13 +34,13 @@ fn permute_steps() {
         if first_waker && poll_completed {
             let permission_to_reschedule = steps::attempt_reschedule(start, counter);
             if permission_to_reschedule {
-                println!("waker thread has permission to reschedule");
+                println!("  waker thread has permission to reschedule");
             }
         }
-        println!("waker thread complete");
     }
 
     interleave_futures(|| {
+        println!("next execution");
         let start = 0;
         let counter = Rc::new(AtomicUsize::new(start));
         vec![
