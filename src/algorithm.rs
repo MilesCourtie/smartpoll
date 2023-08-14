@@ -19,7 +19,7 @@ pub(crate) mod task {
         /* SAFETY:
             We remove the Pin from the Arc and immediately put it back after attempting to
             reset the counter. Regardless of whether the counter is reset, no data is moved
-            so the pinning contract is not violated.
+            or dropped so the pinning contract is not violated.
         */
         let mut task_inner = unsafe { Pin::into_inner_unchecked(task_inner) };
         if let Some(inner) = Arc::get_mut(&mut task_inner) {
