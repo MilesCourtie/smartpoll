@@ -6,7 +6,7 @@ use core::{future::Future, pin::Pin, sync::atomic::AtomicUsize};
 extern crate alloc;
 use alloc::rc::Rc;
 
-//#[test]
+#[test]
 #[allow(dead_code)]
 fn permute_steps() {
     async fn new_task_thread(start: usize, counter: Rc<AtomicUsize>) {
