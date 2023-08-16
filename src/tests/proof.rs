@@ -19,7 +19,7 @@ fn exhaustive_proof_2_wakers() {
         if waker_invoked {
             let permission_to_reschedule = steps::attempt_reschedule(start, counter);
             if permission_to_reschedule {
-                println!("  task thread has permission to reschedule");
+                println!("  task thread reschedules the task");
             }
         }
     }
@@ -28,13 +28,13 @@ fn exhaustive_proof_2_wakers() {
         use algorithm::waker as steps;
         let counter = counter.as_ref();
 
-        let (first_waker, poll_completed) = steps::on_wake(start, counter);
+        let should_proceed = steps::on_wake(start, counter);
         yield_now().await;
 
-        if first_waker && poll_completed {
-            let permission_to_reschedule = steps::attempt_reschedule(start, counter);
-            if permission_to_reschedule {
-                println!("  waker thread has permission to reschedule");
+        if should_proceed {
+            let should_reschedule = steps::attempt_reschedule(start, counter);
+            if should_reschedule {
+                println!("  waker thread reschedules the task");
             }
         }
     }

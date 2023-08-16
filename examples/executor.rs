@@ -60,9 +60,12 @@ impl Executor {
             move |task| queue_tx.send(task).unwrap()
         };
 
+        let num_active_tasks = Arc::new(AtomicUsize::new(0));
+
         let workers = (0..num_workers)
             .map(|_| {
                 let reschedule_fn = reschedule_fn.clone();
+                let num_active_tasks = num_active_tasks.clone();
 
                 // channel to send tasks to this worker
                 let (task_tx, task_rx) = mpsc::sync_channel::<Task>(1);
@@ -70,7 +73,9 @@ impl Executor {
                 let join_handle = thread::spawn(move || {
                     // poll tasks until the channel closes
                     while let Ok(task) = task_rx.recv() {
-                        task.poll(reschedule_fn.clone());
+                        if task.poll(reschedule_fn.clone()).is_ready() {
+                            num_active_tasks.fetch_sub(1, Ordering::SeqCst);
+                        }
                     }
                 });
                 Some(Worker {
@@ -79,8 +84,6 @@ impl Executor {
                 })
             })
             .collect::<Vec<_>>();
-
-        let num_active_tasks = Arc::new(AtomicUsize::new(0));
 
         let handle = ExecutorHandle {
             queue_tx,
@@ -147,13 +150,7 @@ impl Drop for Executor {
 
 impl ExecutorHandle {
     fn spawn_task(&self, future: impl Future<Output = ()> + Send + 'static) {
-        let num_active_tasks = self.num_active_tasks.clone();
-        num_active_tasks.fetch_add(1, Ordering::SeqCst);
-        self.queue_tx
-            .send(Task::new(async move {
-                future.await;
-                num_active_tasks.fetch_sub(1, Ordering::SeqCst);
-            }))
-            .unwrap();
+        self.num_active_tasks.fetch_add(1, Ordering::SeqCst);
+        self.queue_tx.send(Task::new(future)).unwrap();
     }
 }
