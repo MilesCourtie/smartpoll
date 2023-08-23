@@ -1,3 +1,5 @@
+//! A collection of utilities used in the crate's tests.
+
 use core::{
     future::Future,
     pin::Pin,
@@ -5,7 +7,7 @@ use core::{
 };
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec, vec::Vec};
 
 mod waker {
     /// Returns a [`Waker`] that does nothing when invoked.
@@ -15,7 +17,13 @@ mod waker {
     }
 
     /* SAFETY:
-        TODO explain why RawWaker contract is upheld
+        It is safe to crate a Waker from the RawWaker defined below as the contract described in
+        the documentation for RawWaker and RawWakerVTable is upheld:
+          - All functions are thread-safe as no data is stored.
+          - All resources are managed correctly, as there are no resources.
+          - The wake() and wake_by_ref() methods *do not* wake the task as is is the intended
+            behaviour of the 'no-op' waker. It is not used as an actual waker, just as a dummy for
+            testing purposes.
     */
     use core::task::{RawWaker, RawWakerVTable, Waker};
     const fn noop_raw_waker() -> RawWaker {
@@ -47,9 +55,12 @@ impl Future for YieldFuture {
     }
 }
 
-/// Performs a depth-first traversal of the tree of all possible interleavings of the futures
-/// returned by the provided closure. The closure must produce the same list of futures each time it
-/// is invoked.
+/// Runs all possible interleavings of the futures returned by the provided closure.
+/// The closure must produce the same list of futures each time it is invoked.
+/// The futures are provided with a dummy waker, and will be polled regardless of when or if the
+/// provided wakers are invoked.
+/// Note that this explores *all* possible interleavings so the complexity grows very rapidly with
+/// both the number of futures and the number of polls required for each future to complete.
 pub(crate) fn interleave_futures<F>(mut init_fn: F)
 where
     F: FnMut() -> Vec<Pin<Box<dyn Future<Output = ()>>>>,
@@ -64,7 +75,7 @@ where
     'next_execution: loop {
         let mut futures = init_fn();
         let futures_len = futures.len();
-        assert!(futures_len != 0, "`init_fn` returned zero futures");
+        assert!(futures_len != 0, "`init_fn` didn't return any futures");
         if let Some(num_futures) = num_futures {
             assert!(
                 futures_len == num_futures,
@@ -138,7 +149,7 @@ where
 
 #[cfg(test)]
 mod metatests {
-    //! tests that check that the utilities used in the tests behave correctly
+    //! tests for the testing utilities
 
     use core::{
         future::Future,
@@ -146,11 +157,11 @@ mod metatests {
         task::Context,
     };
     extern crate alloc;
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, vec};
 
     /// check that `yield_now()` yields control once and then completes
     #[test]
-    fn yielding() {
+    fn yield_now() {
         use super::{waker::noop_waker, yield_now};
 
         let waker = noop_waker();
@@ -161,7 +172,7 @@ mod metatests {
         assert!(future.as_mut().poll(&mut cx).is_ready());
     }
 
-    /// types to use in logging the interleaved execution of multiple futures
+    /// types that enable logging the interleaved execution of futures
     mod logging {
         use core::{
             cell::UnsafeCell,
@@ -170,7 +181,7 @@ mod metatests {
             task::{Context, Poll},
         };
         extern crate alloc;
-        use alloc::rc::Rc;
+        use alloc::{rc::Rc, vec, vec::Vec};
 
         #[derive(Debug, PartialEq, Eq)]
         pub(super) enum LogEntry {
@@ -214,7 +225,7 @@ mod metatests {
         }
 
         impl core::fmt::Debug for Log {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 /* SAFETY
                     Because the UnsafeCell is behind an Rc, which cannot be sent or shared between
                     threads, it is safe to assume that the UnsafeCell is only accessed by one thread
@@ -259,7 +270,7 @@ mod metatests {
 
     /// check that `interleave_futures()` works correctly using a hand-written test case
     #[test]
-    fn interleave_futures_case1() {
+    fn interleave_futures() {
         use logging::{Log, LogEntry, LoggerFut};
         let log = Log::new();
         let test_log = log.clone();
