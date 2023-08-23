@@ -4,11 +4,11 @@ use crate::{
 };
 use core::{future::Future, pin::Pin, sync::atomic::AtomicUsize};
 extern crate alloc;
-use alloc::rc::Rc;
+use alloc::{boxed::Box, rc::Rc, vec};
 
 #[test]
 #[allow(dead_code)]
-fn exhaustive_proof_2_wakers() {
+fn proof() {
     async fn new_task_thread(start: usize, counter: Rc<AtomicUsize>) {
         use algorithm::task as steps;
         let counter = counter.as_ref();
@@ -19,7 +19,9 @@ fn exhaustive_proof_2_wakers() {
         if waker_invoked {
             let permission_to_reschedule = steps::attempt_reschedule(start, counter);
             if permission_to_reschedule {
+                /* TODO
                 println!("  task thread reschedules the task");
+                */
             }
         }
     }
@@ -34,13 +36,14 @@ fn exhaustive_proof_2_wakers() {
         if should_proceed {
             let should_reschedule = steps::attempt_reschedule(start, counter);
             if should_reschedule {
+                /* TODO
                 println!("  waker thread reschedules the task");
+                */
             }
         }
     }
 
     interleave_futures(|| {
-        println!("next execution");
         let start = 0;
         let counter = Rc::new(AtomicUsize::new(start));
         vec![

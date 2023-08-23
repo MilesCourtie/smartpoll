@@ -1,3 +1,4 @@
+#![no_std]
 use core::{
     cell::UnsafeCell,
     future::Future,
@@ -7,7 +8,7 @@ use core::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 extern crate alloc;
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 
 #[cfg(test)]
 mod tests;
