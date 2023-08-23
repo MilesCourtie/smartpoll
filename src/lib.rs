@@ -1,3 +1,13 @@
+//! Smartpoll provides a [`Task`] type that makes it easy to write your own executor for async Rust.
+//! A [`Task`] can contain any [`Future`] that has no output and implements [`Send`].
+//! To poll a [`Task`] you just need to provide a closure that will schedule the task to be polled
+//! again. This closure will be invoked if the task does not complete, only once the task is ready
+//! to be rescheduled.
+//!
+//! Smartpoll's guarantees that if you are able to call [`Task::poll`], it is safe to do so!
+//! It efficiently handles pinning, synchronisation and waker creation so that you can focus on the
+//! important parts of your project.
+
 #![no_std]
 use core::{
     cell::UnsafeCell,
