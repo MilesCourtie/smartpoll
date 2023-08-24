@@ -93,8 +93,13 @@
 //!     }
 //! }
 //! ```
+//!
+//! For an implementation of a multithreaded executor, see this [example].
+//!
+//! [example]: https://github.com/MilesCourtie/smartpoll/blob/main/examples/executor.rs
 
 #![no_std]
+
 use core::{
     cell::UnsafeCell,
     future::Future,
@@ -109,9 +114,11 @@ use alloc::{boxed::Box, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+/// The synchronisation algorithm is explained in this module, which contains the individual steps.
+/// Each step of the algorithm has been moved into its own function for testing purposes.
 mod algorithm;
 
-/// Wrapper around a top-level [`Future`] that simplifies polling it.
+/// Wrapper around a [`Future`] that simplifies polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
 /// Dynamically-sized type which wraps around a [`Future`] and contains shared state that is used to
@@ -126,7 +133,7 @@ struct TaskInner<F: Future<Output = ()> + Send> {
 }
 
 impl Task {
-    /// Converts the provided [`Future`] into a [`Task`].
+    /// Creates a [`Task`] from the provided [`Future`].
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self(Arc::pin(TaskInner::new(future)))
     }

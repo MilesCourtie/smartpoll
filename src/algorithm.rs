@@ -1,4 +1,4 @@
-//! TODO document this module
+// TODO explain the algorithm
 
 pub(crate) mod task {
     use crate::AnyTaskInner;
