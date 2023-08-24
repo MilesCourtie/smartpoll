@@ -64,9 +64,9 @@
 //!     // spawn some tasks
 //!     spawn_task(Task::new(async {
 //!         // async code...
-//!  #        println!("1");
-//!  #        yield_now().await;
-//!  #        println!("2");
+//! #         println!("1");
+//! #         yield_now().await;
+//! #         println!("2");
 //!     }));
 //!     spawn_task(Task::new(async {
 //!         // async code...
