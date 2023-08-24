@@ -1,12 +1,98 @@
 //! Smartpoll provides a [`Task`] type that makes it easy to write your own executor for async Rust.
-//! A [`Task`] can contain any [`Future`] that has no output and implements [`Send`].
-//! To poll a [`Task`] you just need to provide a closure that will schedule the task to be polled
-//! again. This closure will be invoked if the task does not complete, only once the task is ready
-//! to be rescheduled.
+//! It handles synchronisation, pinning and wakers so that you don't have to!
 //!
-//! Smartpoll's guarantees that if you are able to call [`Task::poll`], it is safe to do so!
-//! It efficiently handles pinning, synchronisation and waker creation so that you can focus on the
-//! important parts of your project.
+//! A [`Task`] can be created from any [`Future`] that has no output and implements [`Send`].
+//! To poll a task you just need to provide a closure that will schedule the task to be polled
+//! again. This will be invoked if the task does not complete, but only once the task is ready to be
+//! rescheduled.
+//!
+//! Because you don't have to deal with synchronisation, pinning or providing a [`Waker`], polling a
+//! [`Task`] is much simpler than polling a [`Future`] directly. Only one copy of a task can exist
+//! at a time, so each task has exclusive access to its underlying future. This is possible because
+//! tasks cannot be cloned, and polling a task transfers ownership of it to the rescheduling code.
+//!
+//! Here is an example of a basic single-threaded executor that uses Smartpoll:
+//!
+//! ```rust
+//! use smartpoll::Task;
+//! use std::sync::{
+//!     atomic::{AtomicUsize, Ordering},
+//!     mpsc::channel,
+//!     Arc,
+//! };
+//!
+//! # fn yield_now() -> impl core::future::Future<Output = ()> {
+//! #     use core::{
+//! #         pin::Pin,
+//! #         task::{Context, Poll},
+//! #     };
+//! #     struct YieldFut(bool);
+//! #     impl core::future::Future for YieldFut {
+//! #         type Output = ();
+//! #         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//! #             if self.0 {
+//! #                 self.0 = false;
+//! #                 cx.waker().wake_by_ref();
+//! #                 Poll::Pending
+//! #             } else {
+//! #                 Poll::Ready(())
+//! #             }
+//! #         }
+//! #     }
+//! #     YieldFut(true)
+//! # }
+//! #
+//! fn main() {
+//!     // the executor has a work queue and a 'tasks remaining' counter
+//!     let (work_tx, work_rx) = channel();
+//!     let tasks_remaining = Arc::new(AtomicUsize::new(0));
+//!
+//!     // to reschedule a task, push it onto the work queue
+//!     let reschedule_task = move |task| {
+//!         work_tx.send(task).unwrap();
+//!     };
+//!
+//!     let schedule_task = reschedule_task.clone();
+//!     let task_counter = tasks_remaining.clone();
+//!
+//!     // to spawn a task, schedule it and add 1 to the counter
+//!     let spawn_task = move |task| {
+//!         schedule_task(task);
+//!         task_counter.fetch_add(1, Ordering::SeqCst);
+//!     };
+//!
+//!     // spawn some tasks
+//!     spawn_task(Task::new(async {
+//!         // async code...
+//!  #        println!("1");
+//!  #        yield_now().await;
+//!  #        println!("2");
+//!     }));
+//!     spawn_task(Task::new(async {
+//!         // async code...
+//! #         println!("A");
+//! #         yield_now().await;
+//! #         println!("B");
+//!     }));
+//!     spawn_task(Task::new(async {
+//!         // async code...
+//! #         println!("X");
+//! #         yield_now().await;
+//! #         println!("Y");
+//!     }));
+//!
+//!     while let Ok(task) = work_rx.recv() {
+//!         // poll the next task from the queue
+//!         if task.poll(reschedule_task.clone()).is_ready() {
+//!             // if the task has completed, subtract 1 from the counter
+//!             if tasks_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+//!                 // if the counter was 1, that was the last task
+//!                 break;
+//!             }
+//!         }
+//!     }
+//! }
+//! ```
 
 #![no_std]
 use core::{
