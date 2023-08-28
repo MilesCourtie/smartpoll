@@ -1,5 +1,4 @@
 //! Smartpoll provides a [`Task`] type that makes it easy to write your own executor for async Rust.
-//! It handles synchronisation, pinning and wakers so that you don't have to!
 //!
 //! A [`Task`] can be created from any [`Future`] that has no output and implements [`Send`].
 //! To poll a task you just need to provide a closure that will schedule the task to be polled
@@ -43,22 +42,20 @@
 //! # }
 //! #
 //! fn main() {
-//!     // the executor has a work queue and a 'tasks remaining' counter
+//!     // the executor has a work queue and an 'unfinished tasks' counter
 //!     let (work_tx, work_rx) = channel();
-//!     let tasks_remaining = Arc::new(AtomicUsize::new(0));
+//!     let num_unfinished_tasks = Arc::new(AtomicUsize::new(0));
 //!
 //!     // to reschedule a task, push it onto the work queue
-//!     let reschedule_task = move |task| {
-//!         work_tx.send(task).unwrap();
-//!     };
+//!     let reschedule_task = move |task| work_tx.send(task).unwrap();
 //!
+//!     let task_counter = num_unfinished_tasks.clone();
 //!     let schedule_task = reschedule_task.clone();
-//!     let task_counter = tasks_remaining.clone();
 //!
-//!     // to spawn a task, schedule it and add 1 to the counter
+//!     // to spawn a task, add 1 to the counter and schedule the task
 //!     let spawn_task = move |task| {
-//!         schedule_task(task);
 //!         task_counter.fetch_add(1, Ordering::SeqCst);
+//!         schedule_task(task);
 //!     };
 //!
 //!     // spawn some tasks
@@ -74,18 +71,12 @@
 //! #         yield_now().await;
 //! #         println!("B");
 //!     }));
-//!     spawn_task(Task::new(async {
-//!         // async code...
-//! #         println!("X");
-//! #         yield_now().await;
-//! #         println!("Y");
-//!     }));
 //!
 //!     while let Ok(task) = work_rx.recv() {
 //!         // poll the next task from the queue
 //!         if task.poll(reschedule_task.clone()).is_ready() {
 //!             // if the task has completed, subtract 1 from the counter
-//!             if tasks_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+//!             if num_unfinished_tasks.fetch_sub(1, Ordering::SeqCst) == 1 {
 //!                 // if the counter was 1, that was the last task
 //!                 break;
 //!             }
@@ -96,7 +87,19 @@
 //!
 //! For an implementation of a multithreaded executor, see this [example].
 //!
+//! For an explanation of how the library works, and a proof of its correctness, see the [source].
+//!
 //! [example]: https://github.com/MilesCourtie/smartpoll/blob/main/examples/executor.rs
+//! [source]: https://github.com/MilesCourtie/smartpoll/blob/main/src/lib.rs
+
+/*================================================================================================*/
+
+/*  The aim of this library is to make it easy to poll futures, so that Rust programmers can create
+    their own executors more easily.
+
+    The library does not depend on std or any other libraries in order to make it as portable as
+    possible, and minimise its impact on dependents' compile time and executable size.
+*/
 
 #![no_std]
 
@@ -111,12 +114,45 @@ use core::{
 extern crate alloc;
 use alloc::{boxed::Box, sync::Arc};
 
-#[cfg(test)]
-mod tests;
+/*  The signature of `Future::poll()` shows the obstacles that must be overcome in order to poll a
+    future:
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+
+    1) You must have an exclusive reference to the future.
+    2) That reference must be pinned.
+    3) You must provide a `Context`, which currently just means providing a `Waker`.
+
+    In a single-threaded environment, requirement 1 is relatively straightforward as there is no
+    need for synchronisation between threads. This library is intended for multi-threaded scenarios
+    where the programmer needs to synchronise access to a future between multiple worker threads.
+
+    A naive solution would be to guard each future with a mutex, but this becomes problematic once
+    you consider requirement 2 as pinning does not propagate through a mutex. Instead, this library
+    takes a different approach to synchronisation which makes use of Rust's ownership system.
+
+    The future is stored in a `Task` object which cannot be cloned and does not give out references
+    to the future. Polling the future is done by calling `Task::poll()`, which takes ownership of
+    the `Task` object so that no other code on any thread has access to the future. This method
+    calls `Future::poll()` and provides a waker that the future can use to signal that it is ready
+    to be rescheduled, as per requirement 3.
+
+    The key to the synchronisation is that `Task::poll()` and the waker communicate to ensure that
+    the future is not rescheduled until after `Future::poll()` has returned. This is the 'smart
+    polling' after which the library is named, and is what synchronises access to the future.
+
+    The rescheduling code is a closure provided by the user which is given ownership of the `Task`
+    object when it eventually runs. Even if the waker is cloned, the communication between the
+    wakers and `Task::poll()` ensures that the rescheduling code is called exactly once per poll
+    until the future completes.
+*/
 
 /// The synchronisation algorithm is explained in this module, which contains the individual steps.
 /// Each step of the algorithm has been moved into its own function for testing purposes.
 mod algorithm;
+
+#[cfg(test)]
+mod tests;
 
 /// Wrapper around a [`Future`] that simplifies polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
