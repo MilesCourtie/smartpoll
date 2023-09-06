@@ -1,4 +1,33 @@
-// TODO explain the algorithm
+/*  One purpose of the `Task` abstraction is to synchronise calls to `Future::poll()` for each task.
+    This means that once `Future::poll()` is called on a particular thread, no other thread must
+    call that function on that instance until the existing call has returned.
+
+    This invariant is enforced by two mechanisms. The first makes use of Rust's ownership system to
+    statically ensure that each task has exclusive access to its future. It works as follows: when a
+    task is created from a future it takes ownership of that future. Since the task never gives out
+    references to the future and cannot be cloned, it has exclusive access to the future.
+
+    This alone would be sufficient if it weren't for the fact that the future is given a waker which
+    it can use to reschedule the task. In order to prevent the task from being polled again before
+    the waker has been invoked, calling `Task::poll()` takes ownership of the task object so that
+    the caller no longer has access to it. Because the waker may be invoked on a different thread
+    long after `Task::poll()` has returned, the contents of the task must be stored on the heap and
+    owned by the waker. Since the future is allowed to clone the waker, ownership of the task must
+    actually be shared between the waker and all of its clones. When one of the wakers is invoked
+    it must check that none of the others have already been invoked, and if this is the case it must
+    then take total ownership of the task and give it to the rescheduling code which will arrange
+    for the task to be polled again.
+
+    This strategy works well save for one issue: it is possible for a waker to be invoked before
+    `Future::poll()` has returned. This would allow the task to be rescheduled while it is still
+    running on some thread, which could lead to another thread polling the future at the same time.
+    In this scenario, the waker should not run the rescheduling code but instead signal to the
+    `Task::poll()` thread that the task is ready to be rescheduled immediately. That thread should
+    then run the rescheduling code once `Future::poll()` has returned.
+
+    The algorithm described below detects and handles this scenario, and is the second mechanism
+    that enforces the synchronisation invariant.
+*/
 
 pub(crate) mod task {
     use crate::AnyTaskInner;

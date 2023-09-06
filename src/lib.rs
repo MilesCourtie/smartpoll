@@ -428,10 +428,8 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         // get a reference to the task's counter
         let counter = this.task_inner.counter();
 
-        // if:
-        //   - this waker is still valid,
-        //   - this waker is the first to be invoked for this round, and
-        //   - `Future::poll()` has returned `Pending`
+        // if this waker is still valid, is the first to be invoked for this round, and
+        // `Future::poll()` has returned `Pending`
         if steps::on_wake(this.start, counter) {
             // try to obtain permission to reschedule the task from the `Task::poll()` thread
             let should_reschedule = steps::attempt_reschedule(this.start, counter);
