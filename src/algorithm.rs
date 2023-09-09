@@ -1,32 +1,83 @@
-/*  One purpose of the `Task` abstraction is to synchronise calls to `Future::poll()` for each task.
-    This means that once `Future::poll()` is called on a particular thread, no other thread must
-    call that function on that instance until the existing call has returned.
+/*  One purpose of the `Task` abstraction is to synchronise calls to `Future::poll` for each task.
+    This means that while `Future::poll` is running on a particular thread, no other thread must
+    call `Future::poll` on that same instance. The following describes how this invariant is
+    enforced.
 
-    This invariant is enforced by two mechanisms. The first makes use of Rust's ownership system to
-    statically ensure that each task has exclusive access to its future. It works as follows: when a
-    task is created from a future it takes ownership of that future. Since the task never gives out
-    references to the future and cannot be cloned, it has exclusive access to the future.
+    When `Task::poll` is called it takes ownership of the `Task` object. Since the task cannot be
+    cloned and does not give out references to its future, it is safe for `Task::poll` to assume
+    exclusive access to the task's future, which is stored on the heap in a `TaskInner` object.
+    `Task::poll` then calls `Future::poll` indirectly via `TaskInner::poll`, providing a waker which
+    the future can use to reschedule the task.
 
-    This alone would be sufficient if it weren't for the fact that the future is given a waker which
-    it can use to reschedule the task. In order to prevent the task from being polled again before
-    the waker has been invoked, calling `Task::poll()` takes ownership of the task object so that
-    the caller no longer has access to it. Because the waker may be invoked on a different thread
-    long after `Task::poll()` has returned, the contents of the task must be stored on the heap and
-    owned by the waker. Since the future is allowed to clone the waker, ownership of the task must
-    actually be shared between the waker and all of its clones. When one of the wakers is invoked
-    it must check that none of the others have already been invoked, and if this is the case it must
-    then take total ownership of the task and give it to the rescheduling code which will arrange
-    for the task to be polled again.
+    The waker (and any clones of it the future has made) share ownership of the `TaskInner` object
+    with each other and the `Task` object. As well as the future itself, the `TaskInner` object also
+    contains a pointer-sized, unsigned integer counter which they use to communicate. They each also
+    have a copy of the closure which reschedules a task.
 
-    This strategy works well save for one issue: it is possible for a waker to be invoked before
-    `Future::poll()` has returned. This would allow the task to be rescheduled while it is still
-    running on some thread, which could lead to another thread polling the future at the same time.
-    In this scenario, the waker should not run the rescheduling code but instead signal to the
-    `Task::poll()` thread that the task is ready to be rescheduled immediately. That thread should
-    then run the rescheduling code once `Future::poll()` has returned.
+    Once `Future::poll` has been called it may make arbitrarily many clones of the waker and arrange
+    for each of them to be called at any time on any thread, and it will return either `Pending` or
+    `Ready`. The purpose of the following algorithm is to ensure that:
+      - If `Pending` is returned *and* a waker is invoked, the rescheduling code is called exactly
+        once, but only once both of the above have happened.
+      - If `Ready` is returned, the rescheduling code is not called.
 
-    The algorithm described below detects and handles this scenario, and is the second mechanism
-    that enforces the synchronisation invariant.
+    Calling the rescheduling closure requires constructing a new `Task` object using the `TaskInner`
+    instance that contains the task's future and other data. When `Pending` is returned and a waker
+    is invoked exactly one of the participating threads will do this, effectively taking full
+    ownership of the task before handing it to the rescheduling code. This requires that all of the
+    other participating threads relinquish their ownership of the task.
+
+    The design of the algorithm is explained below.
+
+    The algorithm operates in rounds; each round corresponds to one poll of the task. The code for
+    each round is split into two parts: one is run by `Task::poll` and the other is run by the waker
+    that was provided to `Future::poll`, and is also run by any clones of that waker.
+
+    The participants communicate by atomically increasing the counter stored in the `TaskInner`
+    object which they share. All of the atomic operations use 'sequentially consistent' ordering,
+    meaning that for a given run of the algorithm it will always be possible to determine some
+    sequence in which the operations occurred, and all of the participants will have observed the
+    same sequence of events. It also guarantees that the memory accesses will not be reordered
+    within the same thread.
+
+    Over the course of a round the shared counter will increase from some initial value labelled
+    `start` or `s` to `s+4`, which then becomes the value of `start` for the next round. The counter
+    is occasionally reset to 0 before the start of a round to prevent it from wrapping, but only
+    if there are no leftover wakers from previous rounds.
+
+    At the start of the round, `Task::poll` reads the value of the counter and labels it `start`.
+    It creates a new waker which has a copy of `start` and uses that waker to call `Future::poll`.
+    It then runs the rest of its part of the algorithm according to the following pseudocode:
+
+   1|   if `Future::poll` returned `Pending` {
+   2|       let old_value = counter.fetch_add(2);
+   3|       if the old value of the counter was `start+1` {
+   4|           // a waker has been invoked and incremented the counter
+   5|           // the counter now has a value of `start+3`
+   6|           if counter.compare_exchange(start+3, start+4) is successful {
+   7|               // we have taken full ownership of the task and must reschedule it
+   8|               reschedule(Task);
+   9|           }
+  10|       }
+  11|       return `Pending`;
+  12|   } else {
+  13|       // Future::poll returned `Ready`, so complete the round and return
+  14|       counter.compare_exchange(start, start+4);
+  15|       return `Ready`;
+  16|   }
+
+    At arbitrary times the waker and its clones each run the following:
+
+   1|   if counter.compare_exchange(start, start+1) is unsuccessful because counter == start+2 {
+   2|       // `Future::poll` has returned `Pending` and no other wakers have been invoked yet
+   3|       if counter.compare_exchange(start+2, start+4) is successful {
+   4|           // we have taken full ownership of the task and must reschedule it
+   5|           reschedule(Task);
+   6|       }
+   7|   }
+
+    You may wish to take some time to check for yourself that this algorithm meets the requirements
+    described above for any valid sequence of memory accesses and for any number of wakers.
 */
 
 pub(crate) mod task {

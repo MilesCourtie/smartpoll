@@ -92,15 +92,6 @@
 //! [example]: https://github.com/MilesCourtie/smartpoll/blob/main/examples/executor.rs
 //! [source]: https://github.com/MilesCourtie/smartpoll/blob/main/src/lib.rs
 
-/*================================================================================================*/
-
-/*  The aim of this library is to make it easy to poll futures, so that Rust programmers can create
-    their own executors more easily.
-
-    This library does not depend on std or any other libraries in order to make it as portable as
-    possible, and minimise its impact on dependents' compile time and executable size.
-*/
-
 #![no_std]
 
 use core::{
@@ -114,7 +105,10 @@ use core::{
 extern crate alloc;
 use alloc::{boxed::Box, sync::Arc};
 
-/*  The signature of `Future::poll()` shows the requirements that must be met in order to poll a
+/*  The aim of this library is to make it easier to poll futures, so that Rust programmers can
+    create their own executors more easily.
+
+    The signature of `Future::poll()` shows the requirements that must be met in order to poll a
     future:
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
@@ -151,13 +145,25 @@ use alloc::{boxed::Box, sync::Arc};
 /// moved into its own function for testing purposes.
 mod algorithm;
 
+/// The library's tests include a demonstration of the correctness of the synchronisation algorithm,
+/// which uses an exhaustive search of all possible multithreaded executions to check that the
+/// algorithm works regardless of the order in which the threads run.
 #[cfg(test)]
 mod tests;
 
 /// A task wraps around a [`Future`] to provide a simple interface for polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
-/// A dynamically-sized type which stores a task's future alongside associated data.
+/*  When a future is polled it is given a waker that it can use to reschedule the task. To prevent
+    the task from being polled again before the waker has been invoked, calling `Task::poll()` takes
+    ownership of the task object. Because the waker may be invoked on an arbitrary thread long after
+    `Task::poll()` has returned, the task object cannot store its contents directly as they have
+    to outlive the task object. The contents of the task are stored on the heap in a `TaskInner`
+    object and shared between the task and its wakers, so that when a waker is invoked it can create
+    a new `Task` object with the same contents as the original.
+*/
+
+/// A dynamically-sized type which stores a task's future and associated data.
 struct TaskInner<F: Future<Output = ()> + Send> {
     /// marks this type as !Unpin
     _pin: PhantomPinned,
@@ -177,19 +183,17 @@ impl Task {
     ///
     /// If the future returned [`Poll::Pending`] and arranged for a [`Waker`] to be invoked,
     /// `reschedule_fn` will be called at some point and will be given ownership of this [`Task`].
-    /// In this scenario it is guaranteed that the callback will not be invoked until the waker has
-    /// been invoked *and* [`Future::poll`] has returned, and will be called exactly once. No
+    /// In this scenario it is guaranteed that the callback will not run until the waker has been
+    /// invoked *and* [`Future::poll`] has returned, and will be called exactly once. No further
     /// guarantees are made regarding when this callback will be invoked or on what thread. For
-    /// example, it may be called by a waker on an arbitrary thread in 10 minutes' time, or it might
-    /// have been already been called on the current thread as part of this function.
+    /// example it may be called by a waker on an arbitrary thread in 10 minutes' time, or it might
+    /// have already been called on the current thread as part of this function.
     ///
-    /// Note that there is a very rare exception to the above which may occur under very unlikely
-    /// conditions. If a copy of the waker that is provided to the task's future is kept without
-    /// being invoked, the task is polled `2^(N-2)` times where N is the size of a pointer in bits,
-    /// and then the stored waker is invoked, the `reschedule_fn` provided when that waker was
-    /// created may be called even though it was already called `2^(N-2)` polls ago. This is due to
-    /// the task's internal counter wrapping such that the waker is unable to detect that it is no
-    /// longer valid.
+    /// Note that there is a very unlikely scenario in which the task may be spuriously rescheduled.
+    /// If a clone of a waker provided to the future is stored while the task is polled a further
+    /// `2^(N-2)` times, where `N` is the size of a pointer in bits, the task's internal counter
+    /// will wrap such that the stored waker will not be able to detect that it is outdated. If the
+    /// outdated waker is then invoked it may reschedule the task.
     pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> Poll<()> {
         // the synchronisation algorithm is explained fully in the `algorithm` module
         use algorithm::task as steps;
@@ -235,11 +239,11 @@ impl Task {
         */
         let result = unsafe { inner.as_ref().poll(&waker) };
 
-        // if the future returned 'pending'
+        // if `Future::poll()` returned `Pending`
         if result.is_pending() {
             // and a waker has been invoked
             if steps::was_waker_invoked(start, counter) {
-                // try to obtain permission to reschedule the task from the waker threads
+                // try to take full ownership of the task
                 let should_reschedule = steps::attempt_reschedule(start, counter);
                 // if this was successful then reschedule the task
                 if should_reschedule {
@@ -431,7 +435,7 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         // if this waker is still valid, is the first to be invoked for this round, and
         // `Future::poll()` has returned `Pending`
         if steps::on_wake(this.start, counter) {
-            // try to obtain permission to reschedule the task from the `Task::poll()` thread
+            // try to take full ownership of the task
             let should_reschedule = steps::attempt_reschedule(this.start, counter);
             // if this was successful then reschedule the task
             if should_reschedule {
