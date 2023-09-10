@@ -1,2 +1,2 @@
-mod proof;
+mod correctness;
 mod util;
