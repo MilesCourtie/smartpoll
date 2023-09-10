@@ -38,21 +38,21 @@ mod waker {
 }
 
 /// Returns a [`Future`] that yields control to the executor once before completing.
-pub(crate) fn yield_now() -> YieldFuture {
-    YieldFuture(true)
-}
-pub(crate) struct YieldFuture(bool);
-impl Future for YieldFuture {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0 {
-            self.0 = false;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        } else {
-            Poll::Ready(())
+pub(crate) fn yield_once() -> impl Future<Output = ()> {
+    pub(crate) struct YieldFuture(bool);
+    impl Future for YieldFuture {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0 {
+                self.0 = false;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
         }
     }
+    YieldFuture(true)
 }
 
 /// Runs all possible interleavings of the futures returned by the provided closure.
@@ -159,15 +159,15 @@ mod metatests {
     extern crate alloc;
     use alloc::{boxed::Box, vec};
 
-    /// check that `yield_now()` yields control once and then completes
+    /// check that `yield_once()` yields control once and then completes
     #[test]
-    fn yield_now() {
-        use super::{waker::noop_waker, yield_now};
+    fn yield_once() {
+        use super::{waker::noop_waker, yield_once};
 
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let mut future = pin!(yield_now());
+        let mut future = pin!(yield_once());
         assert!(future.as_mut().poll(&mut cx).is_pending());
         assert!(future.as_mut().poll(&mut cx).is_ready());
     }

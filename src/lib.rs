@@ -20,13 +20,13 @@
 //!     Arc,
 //! };
 //!
-//! # fn yield_now() -> impl core::future::Future<Output = ()> {
+//! # fn yield_once() -> impl core::future::Future<Output = ()> {
 //! #     use core::{
 //! #         pin::Pin,
 //! #         task::{Context, Poll},
 //! #     };
-//! #     struct YieldFut(bool);
-//! #     impl core::future::Future for YieldFut {
+//! #     struct YieldFuture(bool);
+//! #     impl core::future::Future for YieldFuture {
 //! #         type Output = ();
 //! #         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 //! #             if self.0 {
@@ -38,7 +38,7 @@
 //! #             }
 //! #         }
 //! #     }
-//! #     YieldFut(true)
+//! #     YieldFuture(true)
 //! # }
 //! #
 //! fn main() {
@@ -62,13 +62,13 @@
 //!     spawn_task(Task::new(async {
 //!         // async code...
 //! #         println!("1");
-//! #         yield_now().await;
+//! #         yield_once().await;
 //! #         println!("2");
 //!     }));
 //!     spawn_task(Task::new(async {
 //!         // async code...
 //! #         println!("A");
-//! #         yield_now().await;
+//! #         yield_once().await;
 //! #         println!("B");
 //!     }));
 //!

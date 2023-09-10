@@ -1,6 +1,6 @@
 use crate::{
     algorithm,
-    tests::util::{interleave_futures, yield_now},
+    tests::util::{interleave_futures, yield_once},
 };
 use core::{future::Future, pin::Pin, sync::atomic::AtomicUsize};
 extern crate alloc;
@@ -13,7 +13,7 @@ fn correctness() {
         let counter = counter.as_ref();
 
         let waker_invoked = steps::was_waker_invoked(start, counter);
-        yield_now().await;
+        yield_once().await;
 
         if waker_invoked {
             let permission_to_reschedule = steps::claim_ownership(start, counter);
@@ -30,7 +30,7 @@ fn correctness() {
         let counter = counter.as_ref();
 
         let should_proceed = steps::on_wake(start, counter);
-        yield_now().await;
+        yield_once().await;
 
         if should_proceed {
             let should_reschedule = steps::claim_ownership(start, counter);
