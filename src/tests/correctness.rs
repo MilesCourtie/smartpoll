@@ -7,7 +7,6 @@ extern crate alloc;
 use alloc::{boxed::Box, rc::Rc, vec};
 
 #[test]
-#[allow(dead_code)]
 fn correctness() {
     async fn new_task_thread(start: usize, counter: Rc<AtomicUsize>) {
         use algorithm::task as steps;
@@ -17,7 +16,7 @@ fn correctness() {
         yield_now().await;
 
         if waker_invoked {
-            let permission_to_reschedule = steps::attempt_reschedule(start, counter);
+            let permission_to_reschedule = steps::claim_ownership(start, counter);
             if permission_to_reschedule {
                 /* TODO
                 println!("  task thread reschedules the task");
@@ -34,7 +33,7 @@ fn correctness() {
         yield_now().await;
 
         if should_proceed {
-            let should_reschedule = steps::attempt_reschedule(start, counter);
+            let should_reschedule = steps::claim_ownership(start, counter);
             if should_reschedule {
                 /* TODO
                 println!("  waker thread reschedules the task");

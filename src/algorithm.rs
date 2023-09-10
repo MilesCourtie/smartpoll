@@ -1,53 +1,51 @@
 /*  One purpose of the `Task` abstraction is to synchronise calls to `Future::poll` for each task.
     This means that while `Future::poll` is running on a particular thread, no other thread must
-    call `Future::poll` on that same instance. The following describes how this invariant is
-    enforced.
+    call it on that same instance. The following describes how this invariant is enforced.
 
     When `Task::poll` is called it takes ownership of the `Task` object. Since the task cannot be
     cloned and does not give out references to its future, it is safe for `Task::poll` to assume
-    exclusive access to the task's future, which is stored on the heap in a `TaskInner` object.
-    `Task::poll` then calls `Future::poll` indirectly via `TaskInner::poll`, providing a waker which
-    the future can use to reschedule the task.
+    it has exclusive access to the that future, which is stored on the heap in a `TaskInner` object.
+    `Task::poll` calls `Future::poll` indirectly via `TaskInner::poll`, providing a waker which the
+    future can use to reschedule the task.
 
-    The waker (and any clones of it the future has made) share ownership of the `TaskInner` object
-    with each other and the `Task` object. As well as the future itself, the `TaskInner` object also
-    contains a pointer-sized, unsigned integer counter which they use to communicate. They each also
-    have a copy of the closure which reschedules a task.
+    The waker (and any clones of it the future makes) share ownership of the `TaskInner` object with
+    each other and the `Task` object. As well as the future itself, this also contains a counter
+    which they use to communicate. They each also have a copy of the 'reschedule' closure.
 
     Once `Future::poll` has been called it may make arbitrarily many clones of the waker and arrange
-    for each of them to be called at any time on any thread, and it will return either `Pending` or
+    for each of them to be invoked at any time on any thread, and it will return either `Pending` or
     `Ready`. The purpose of the following algorithm is to ensure that:
-      - If `Pending` is returned *and* a waker is invoked, the rescheduling code is called exactly
-        once, but only once both of the above have happened.
+      - If `Pending` is returned and a waker is invoked, the rescheduling code is called exactly
+        once, but only once both conditions have been met.
       - If `Ready` is returned, the rescheduling code is not called.
 
-    Calling the rescheduling closure requires constructing a new `Task` object using the `TaskInner`
-    instance that contains the task's future and other data. When `Pending` is returned and a waker
-    is invoked exactly one of the participating threads will do this, effectively taking full
-    ownership of the task before handing it to the rescheduling code. This requires that all of the
-    other participating threads relinquish their ownership of the task.
+    Calling the rescheduling closure requires constructing a new `Task` object using the existing
+    `TaskInner` object. When `Pending` is returned and a waker is invoked exactly one of the
+    participating threads will do this, effectively taking full ownership of the task before handing
+    it to the rescheduling code. This requires that all of the other participating threads
+    relinquish their ownership of the task.
 
     The design of the algorithm is explained below.
 
-    The algorithm operates in rounds; each round corresponds to one poll of the task. The code for
+    The algorithm operates in rounds; one round corresponds to one poll of the task. The code for
     each round is split into two parts: one is run by `Task::poll` and the other is run by the waker
-    that was provided to `Future::poll`, and is also run by any clones of that waker.
+    that was provided to `Future::poll` whenever it is invoked, and is also run by any clones of
+    that waker whenever they are invoked.
 
     The participants communicate by atomically increasing the counter stored in the `TaskInner`
-    object which they share. All of the atomic operations use 'sequentially consistent' ordering,
-    meaning that for a given run of the algorithm it will always be possible to determine some
-    sequence in which the operations occurred, and all of the participants will have observed the
-    same sequence of events. It also guarantees that the memory accesses will not be reordered
-    within the same thread.
+    object. All of the atomic operations use sequentially consistent ordering, meaning that for a
+    given run of the algorithm it will always be possible to determine some sequence in which the
+    operations occurred, and all of the participants will have observed that same sequence. It also
+    guarantees that the memory accesses will not be reordered within the same thread.
 
-    Over the course of a round the shared counter will increase from some initial value labelled
-    `start` or `s` to `s+4`, which then becomes the value of `start` for the next round. The counter
-    is occasionally reset to 0 before the start of a round to prevent it from wrapping, but only
-    if there are no leftover wakers from previous rounds.
+    Over the course of a round the shared counter increases from some initial value labelled `start
+    to `start + 4`, which then becomes the value of `start` for the next round. The counter is
+    occasionally reset to 0 before the start of a round to prevent it from wrapping, but only if
+    there are no leftover wakers from previous rounds.
 
     At the start of the round, `Task::poll` reads the value of the counter and labels it `start`.
     It creates a new waker which has a copy of `start` and uses that waker to call `Future::poll`.
-    It then runs the rest of its part of the algorithm according to the following pseudocode:
+    It then acts according to the following pseudocode:
 
    1|   if `Future::poll` returned `Pending` {
    2|       let old_value = counter.fetch_add(2);
@@ -76,8 +74,15 @@
    6|       }
    7|   }
 
-    You may wish to take some time to check for yourself that this algorithm meets the requirements
-    described above for any valid sequence of memory accesses and for any number of wakers.
+    You may wish to check for yourself that this algorithm meets the requirements described above
+    for any valid sequence of memory accesses and for any number of wakers. An argument for its
+    correctness is given in the module `src/tests/correctness.rs`, which includes automated tests
+    that run all possible sequences of memory accesses for each test case.
+
+    To aid with the development of these tests, each atomic access of the shared counter used by
+    the algorithm has been isolated into its own function. These functions are shown below and are
+    used both by the tests and the implementation itself. They are grouped into those used by
+    `Task::poll` and those used by the wakers.
 */
 
 pub(crate) mod task {
@@ -96,7 +101,7 @@ pub(crate) mod task {
 
     /// The task thread occasionally calls this before polling the task to try and keep the counter
     /// from overflowing. Returns a bool that is true iff the counter was reset, and gives back
-    /// ownership of the `TaskInner` instance, which must have no clones for this method to succeed.
+    /// ownership of the `TaskInner` instance, which must have no clones for this to succeed.
     pub(crate) fn try_reset_counter(
         task_inner: Pin<Arc<dyn AnyTaskInner>>,
     ) -> (bool, Pin<Arc<dyn AnyTaskInner>>) {
@@ -123,7 +128,7 @@ pub(crate) mod task {
             n if n == start => false,
             n if n == start + 1 => true,
             n => panic!(
-                "BUG: counter was unexpectedly {n} after poll \
+                "BUG: counter was unexpectedly {n} after poll returned \
                 (expected {} or {})",
                 start,
                 start + 1,
@@ -131,15 +136,17 @@ pub(crate) mod task {
         }
     }
 
-    /// The last step of the task thread's side of the algorithm, to be called if
-    /// `was_waker_invoked` returns true. Returns true iff the task thread should reschedule the
-    /// task.
-    pub(crate) fn attempt_reschedule(start: usize, counter: &AtomicUsize) -> bool {
+    /// The last step of the task thread's side of the algorithm, called only if `was_waker_invoked`
+    /// returned true. Returns true iff the task thread has successfully claimed full ownership of
+    /// the task object and must now reschedule it.
+    pub(crate) fn claim_ownership(start: usize, counter: &AtomicUsize) -> bool {
         match counter.compare_exchange(start + 3, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
+            // this thread succeeded in setting the counter to `start + 4`, so has claimed ownership
             Ok(_) => true,
+            // another thread has already set the counter to `start + 4`
             Err(n) if n == start + 4 => false,
             Err(n) => panic!(
-                "BUG: counter was unexpectedly {n} when task tried to reschedule \
+                "BUG: counter was unexpectedly {n} when task thread tried to claim ownership \
                 (expected {})",
                 start + 3
             ),
@@ -150,7 +157,16 @@ pub(crate) mod task {
     /// 'was_waker_invoked'.
     pub(crate) fn task_complete(start: usize, counter: &AtomicUsize) {
         let result = counter.compare_exchange(start, start + 4, Ordering::SeqCst, Ordering::SeqCst);
-        // TODO explain why it is okay to ignore the result
+        /* The result of the compare_exchange can safely be ignored:
+            - If the future behaved correctly and did not use the provided waker in its final poll,
+              the compare_exchange will have succeeded. This information is not needed. Any
+              remaining wakers will detect that they are outdated because the counter has increased.
+            - If the future behaved improperly and used the provided waker in its final poll,
+              the compare_exchange may fail if the waker has already been invoked. This information
+              is not needed, and the 'incorrect' counter value does not matter because the task will
+              not be polled again. This is because the waker will not have rescheduled the task, and
+              any other wakers will detect that they are outdated because the counter has increased.
+        */
         let _ = result;
     }
 }
@@ -163,7 +179,7 @@ pub(crate) mod waker {
     /// to the next step.
     pub(crate) fn on_wake(start: usize, counter: &AtomicUsize) -> bool {
         match counter.compare_exchange(start, start + 1, Ordering::SeqCst, Ordering::SeqCst) {
-            // the poll has completed and this is is the first waker to be invoked
+            // the poll has finished and this is is the first waker to be invoked
             Err(n) if n == start + 2 => true,
             /* all other cases return false:
               Ok(_) => this is the first waker to be invoked, but the poll hasn't finished
@@ -175,18 +191,16 @@ pub(crate) mod waker {
         }
     }
 
-    /// The second step of a waker's side of the algorithm. Returns true iff the waker should
-    /// reschedule the task.
-    pub(crate) fn attempt_reschedule(start: usize, counter: &AtomicUsize) -> bool {
+    /// The second step of a waker's side of the algorithm. Returns true iff the waker has claimed
+    /// full ownership of the task object and must now reschedule it.
+    pub(crate) fn claim_ownership(start: usize, counter: &AtomicUsize) -> bool {
         match counter.compare_exchange(start + 2, start + 4, Ordering::SeqCst, Ordering::SeqCst) {
-            // this thread succeeded in setting the counter to `start + 4`, so has permission to
-            // reschedule the task
+            // this thread succeeded in setting the counter to `start + 4`, so has claimed ownership
             Ok(_) => true,
             // another thread has already set the counter to `start + 4`
             Err(n) if n == start + 4 => false,
-            // something has gone wrong
             Err(n) => panic!(
-                "BUG: counter was unexpectedly {n} when waker attempted to reschedule \
+                "BUG: counter was unexpectedly {n} when waker attempted to claim ownership \
                 (expected {} or {})",
                 start + 2,
                 start + 4,
@@ -194,31 +208,3 @@ pub(crate) mod waker {
         }
     }
 }
-
-// Explanation of the synchronisation algorithm:
-// (TODO move this to somewhere more sensible)
-//
-// Each time the task goes through the cycle of being polled and rescheduled, the counter
-// is incremented by 4. the process is as follows:
-//  1. Initially the counter is equal to 4n, where n is a non-negative integer. A waker is
-//     created that stores the number 4n so that it can check it is still valid when invoked.
-//  2. The future is polled and does not complete, so arranges for the waker to be invoked.
-//     It may create multiple copies of the waker and arrange for many of them to be invoked.
-//  3. If a waker is invoked while the future is still being polled, it sets the counter to
-//     4n+1 iff its value is 4n. If this fails, another waker was invoked so this one halts.
-//  4. Once `task::poll` has finished polling the future, it increments the counter by 2,
-//     noting the value it is replacing. Iff the value was 4n+1 it knows a waker has been
-//     invoked, otherwise it halts as there is nothing left to do until a waker is invoked.
-//  5. If a waker is invoked while the counter is 4n+2 or 4n+3, it will try to increment the
-//     counter to 4n+1 but fail as the value isn't 4n. The waker will know from the counter's
-//     value that (a) the task has finished being polled, and (b) whether another waker has
-//     already been invoked.
-//  6. The waker that incremented the counter and `task::poll` (if it didn't halt in step 4)
-//     try to increase the counter from 4n+3 to 4n+4 using `compare_exchange`.
-//     Whichever one succeeds then reschedules the task, and the counter is equal to 4(n+1).
-//
-// N.B.
-//  *1 The counter is initially 0, and occasionally it is reset to 0 before step 1 if there
-//     are no wakers. This is to prevent it from overflowing.
-//  *2 If the future completes in step 2, the counter is set to 4n+4 by `task::poll` and is not
-//     modified again as there won't be any new wakers after that point.

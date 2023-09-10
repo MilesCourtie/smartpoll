@@ -244,7 +244,7 @@ impl Task {
             // and a waker has been invoked
             if steps::was_waker_invoked(start, counter) {
                 // try to take full ownership of the task
-                let should_reschedule = steps::attempt_reschedule(start, counter);
+                let should_reschedule = steps::claim_ownership(start, counter);
                 // if this was successful then reschedule the task
                 if should_reschedule {
                     reschedule_fn(Self(inner));
@@ -436,7 +436,7 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         // `Future::poll()` has returned `Pending`
         if steps::on_wake(this.start, counter) {
             // try to take full ownership of the task
-            let should_reschedule = steps::attempt_reschedule(this.start, counter);
+            let should_reschedule = steps::claim_ownership(this.start, counter);
             // if this was successful then reschedule the task
             if should_reschedule {
                 (this.reschedule_fn)(Task(this.task_inner.clone()));
