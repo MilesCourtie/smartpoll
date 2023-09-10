@@ -1,10 +1,10 @@
 use crate::{
     algorithm,
-    tests::util::{interleave_futures, yield_once},
+    tests::util::{yield_once, Sequencer},
 };
-use core::{future::Future, pin::Pin, sync::atomic::AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 extern crate alloc;
-use alloc::{boxed::Box, rc::Rc, vec};
+use alloc::{rc::Rc, vec};
 
 #[test]
 fn correctness() {
@@ -42,13 +42,20 @@ fn correctness() {
         }
     }
 
-    interleave_futures(|| {
+    let mut sequencer = Sequencer::new();
+
+    loop {
         let start = 0;
         let counter = Rc::new(AtomicUsize::new(start));
-        vec![
-            Box::pin(new_task_thread(start, counter.clone())) as Pin<Box<dyn Future<Output = ()>>>,
-            Box::pin(new_waker_thread(start, counter.clone())) as Pin<Box<dyn Future<Output = ()>>>,
-            Box::pin(new_waker_thread(start, counter.clone())) as Pin<Box<dyn Future<Output = ()>>>,
-        ]
-    });
+
+        let done = sequencer.run_next_sequence(vec![
+            Sequencer::prepare(new_task_thread(start, counter.clone())),
+            Sequencer::prepare(new_waker_thread(start, counter.clone())),
+            Sequencer::prepare(new_waker_thread(start, counter.clone())),
+        ]);
+
+        if done {
+            break;
+        }
+    }
 }
