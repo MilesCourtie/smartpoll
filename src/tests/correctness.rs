@@ -8,7 +8,7 @@ use alloc::{boxed::Box, rc::Rc, vec};
 
 #[test]
 #[allow(dead_code)]
-fn proof() {
+fn correctness() {
     async fn new_task_thread(start: usize, counter: Rc<AtomicUsize>) {
         use algorithm::task as steps;
         let counter = counter.as_ref();
