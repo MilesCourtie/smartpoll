@@ -1,6 +1,3 @@
-//! This module contains utilities used in the crate's tests, alongside tests that check the
-//! correctness of those utilities.
-
 use core::{
     future::Future,
     pin::Pin,
@@ -25,7 +22,10 @@ pub(crate) fn yield_once() -> impl Future<Output = ()> {
     YieldFuture(true)
 }
 
+pub(crate) use noop_waker::noop_waker;
 mod noop_waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
     /// Returns a [`Waker`] that does nothing when invoked.
     pub(crate) fn noop_waker() -> Waker {
         // SAFETY: see below
@@ -41,7 +41,6 @@ mod noop_waker {
             behaviour of the 'no-op' waker. It is not used as an actual waker, just as a dummy for
             testing purposes.
     */
-    use core::task::{RawWaker, RawWakerVTable, Waker};
     const fn noop_raw_waker() -> RawWaker {
         RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
     }
@@ -81,7 +80,7 @@ mod sequencer {
         pub fn new() -> Self {
             Self {
                 num_futures: None,
-                noop_waker: super::noop_waker::noop_waker(),
+                noop_waker: super::noop_waker(),
                 next_sequence: vec![0],
             }
         }
@@ -175,7 +174,7 @@ mod sequencer {
 
 #[cfg(test)]
 mod tests {
-    use super::{noop_waker, yield_once};
+    use super::{noop_waker, yield_once, Sequencer};
     use core::{future::Future, pin::pin, task::Context};
     extern crate alloc;
     use alloc::vec;
@@ -190,7 +189,7 @@ mod tests {
         assert!(future.as_mut().poll(&mut cx).is_ready());
     }
 
-    /// types that enable logging the sequencer
+    /// types that can be used for logging runs of the sequencer
     mod sequence_logging {
         use core::{
             cell::UnsafeCell,
@@ -289,7 +288,6 @@ mod tests {
     /// check that the sequencer works correctly using a hand-written test case
     #[test]
     fn sequencer() {
-        use super::Sequencer;
         use sequence_logging::*;
 
         let log = Log::new();

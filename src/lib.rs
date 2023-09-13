@@ -141,15 +141,15 @@ use alloc::{boxed::Box, sync::Arc};
     until the future completes.
 */
 
-/// The synchronisation algorithm is explained in this module. Each step of the algorithm has been
-/// moved into its own function for testing purposes.
+/// The synchronisation algorithm is explained in this module, which contains the steps of the
+/// algorithm separated into separate functions for testing purposes. The tests use an exhaustive
+/// search of all possible multithreaded executions to check that the algorithm works regardless of
+/// how the threads are scheduled.
 mod algorithm;
 
-/// The library's tests include a demonstration of the correctness of the synchronisation algorithm,
-/// which uses an exhaustive search of all possible multithreaded executions to check that the
-/// algorithm works regardless of the order in which the threads run.
+/// This module contains utilities that are used in the crate's tests.
 #[cfg(test)]
-mod tests;
+mod util;
 
 /// A task wraps around a [`Future`] to provide a simple interface for polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
