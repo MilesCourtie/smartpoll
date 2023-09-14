@@ -4,7 +4,7 @@ use core::{
     task::{Context, Poll},
 };
 
-// Returns a [`Future`] that yields control to the executor once before completing.
+/// Returns a [`Future`] that yields control to the executor once before completing.
 pub(crate) fn yield_once() -> impl Future<Output = ()> {
     pub(crate) struct YieldFuture(bool);
     impl Future for YieldFuture {
@@ -62,14 +62,9 @@ mod sequencer {
     extern crate alloc;
     use alloc::{boxed::Box, vec, vec::Vec};
 
-    /*  Runs all possible interleavings of the futures returned by the provided closure. The closure
-        must produce the same list of futures each time it is invoked. The futures are provided with
-        a dummy waker, and will be polled regardless of when or if the provided wakers are invoked.
-        Note that this explores *all* possible interleavings so the complexity grows very rapidly
-        with both the number of futures and the number of polls required for each future to
-        complete.
-    */
-
+    /// Used to run a collection of [`Future`]s multiple times, exhausting every possible sequence
+    /// in which they can be polled.
+    /// Does not wait for [`Waker`] invocation so must not be used as a general-purpose executor.
     pub(crate) struct Sequencer {
         num_futures: Option<usize>,
         noop_waker: Waker,
@@ -77,6 +72,7 @@ mod sequencer {
     }
 
     impl Sequencer {
+        /// Create a new `Sequencer`.
         pub fn new() -> Self {
             Self {
                 num_futures: None,
@@ -85,12 +81,17 @@ mod sequencer {
             }
         }
 
+        /// Helper function that converts an `impl Future` to a `Pin<Box<dyn Future>>`.
         pub fn prepare(
             future: impl Future<Output = ()> + 'static,
         ) -> Pin<Box<dyn Future<Output = ()>>> {
             Box::pin(future) as Pin<Box<dyn Future<Output = ()>>>
         }
 
+        /// Run the provided collection of [`Futures`] according to the next unexplored polling
+        /// sequence. Will panic if a different number of futures are provided than were given
+        /// in a previous call for the same `Sequencer`, or if any of the futures complete sooner
+        /// than they did in an earlier sequence.
         pub fn run_next_sequence(
             &mut self,
             mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>>,
@@ -179,7 +180,7 @@ mod tests {
     extern crate alloc;
     use alloc::vec;
 
-    /// check that `yield_once()` yields control once and then completes
+    /// Check that `yield_once` yields control once and then completes.
     #[test]
     fn yield_test() {
         let waker = noop_waker::noop_waker();
@@ -285,7 +286,7 @@ mod tests {
         }
     }
 
-    /// check that the sequencer works correctly using a hand-written test case
+    /// Check that the sequencer works correctly using a hand-written test case.
     #[test]
     fn sequencer() {
         use sequence_logging::*;

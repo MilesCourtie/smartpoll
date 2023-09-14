@@ -151,7 +151,7 @@ mod algorithm;
 #[cfg(test)]
 mod util;
 
-/// A task wraps around a [`Future`] to provide a simple interface for polling it.
+/// A [`Task`] wraps around a [`Future`] to provide a simple interface for polling it.
 pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 
 /*  When a future is polled it is given a waker that it can use to reschedule the task. To prevent
@@ -193,7 +193,7 @@ impl Task {
     /// If a clone of a waker provided to the future is stored while the task is polled a further
     /// `2^(N-2)` times, where `N` is the size of a pointer in bits, the task's internal counter
     /// will wrap such that the stored waker will not be able to detect that it is outdated. If the
-    /// outdated waker is then invoked it may reschedule the task.
+    /// outdated waker is then invoked it may cause the task to be rescheduled.
     pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> Poll<()> {
         // the synchronisation algorithm is explained fully in the `algorithm` module
         use algorithm::task as steps;
@@ -205,6 +205,12 @@ impl Task {
         // Try to safely reset the counter every 2^16 polls (i.e. every 2^18 increments).
         // This will succeed if there are no leftover wakers from previous polls, in which case it
         // will prevent the counter from wrapping unexpectedly.
+        //
+        // Note that even if the counter does wrap such that an outdated waker participates in a
+        // round which it shouldn't, no safety invariants can be violated because the outdated waker
+        // will still participate in the round properly, just as any other waker would. The worst
+        // possible outcome is that the task is rescheduled spuriously (but still in a valid way)
+        // as a result of the outdated waker's participation.
         let inner = if start & 0x3ffff == 0 {
             let (success, inner) = steps::try_reset_counter(self.0);
             if success {
@@ -239,19 +245,18 @@ impl Task {
         */
         let result = unsafe { inner.as_ref().poll(&waker) };
 
-        // if `Future::poll()` returned `Pending`
+        // if `Future::poll` returned `Pending`
         if result.is_pending() {
             // and a waker has been invoked
             if steps::was_waker_invoked(start, counter) {
-                // try to take full ownership of the task
-                let should_reschedule = steps::claim_ownership(start, counter);
-                // if this was successful then reschedule the task
-                if should_reschedule {
+                // try to claim full ownership of the task
+                if steps::claim_ownership(start, counter) {
+                    // if successful then reschedule the task
                     reschedule_fn(Self(inner));
                 }
             }
         } else {
-            // else the future returned 'ready', so end the algorithm
+            // else the future returned `Ready`, so end the algorithm
             steps::task_complete(start, counter);
         }
 
@@ -433,12 +438,11 @@ impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
         let counter = this.task_inner.counter();
 
         // if this waker is still valid, is the first to be invoked for this round, and
-        // `Future::poll()` has returned `Pending`
+        // `Future::poll` has returned `Pending`
         if steps::on_wake(this.start, counter) {
-            // try to take full ownership of the task
-            let should_reschedule = steps::claim_ownership(this.start, counter);
-            // if this was successful then reschedule the task
-            if should_reschedule {
+            // try to claim full ownership of the task
+            if steps::claim_ownership(this.start, counter) {
+                // if successful then reschedule the task
                 (this.reschedule_fn)(Task(this.task_inner.clone()));
             }
         }
