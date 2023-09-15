@@ -63,8 +63,8 @@ mod sequencer {
     use alloc::{boxed::Box, vec, vec::Vec};
 
     /// Used to run a collection of [`Future`]s multiple times, exhausting every possible sequence
-    /// in which they can be polled.
-    /// Does not wait for [`Waker`] invocation so must not be used as a general-purpose executor.
+    /// in which they can be polled. Does not wait for [`Waker`] invocation so must not be used as
+    /// a general-purpose executor.
     pub(crate) struct Sequencer {
         num_futures: Option<usize>,
         noop_waker: Waker,
@@ -210,6 +210,7 @@ mod tests {
 
         #[derive(Clone)]
         pub(super) struct Log(Rc<UnsafeCell<Vec<LogEntry>>>);
+
         impl Log {
             pub fn new() -> Self {
                 Self(Rc::new(UnsafeCell::new(vec![])))
