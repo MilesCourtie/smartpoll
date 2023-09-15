@@ -1,95 +1,111 @@
-//! Smartpoll provides a [`Task`] type that makes it easy to write your own executor for async Rust.
+//! Smartpoll provides a [`Task`] type that makes it easy to write your own multithreaded executor
+//! for async Rust.
 //!
 //! A [`Task`] can be created from any [`Future`] that has no output and implements [`Send`].
 //! To poll a task you just need to provide a closure that will schedule the task to be polled
 //! again. This will be invoked if the task does not complete, but only once the task is ready to be
 //! rescheduled.
 //!
-//! Because you don't have to deal with synchronisation, pinning or providing a [`Waker`], polling a
-//! task is much simpler than polling a future directly. Only one copy of a task can exist at a
-//! time, so each task has exclusive access to its underlying future. This is possible because tasks
-//! cannot be cloned, and polling a task transfers ownership of it to the rescheduling code.
-//!
-//! Here is an example of a basic single-threaded executor that uses Smartpoll:
+//! Polling tasks is much simpler than polling their futures directly as you do not have to deal
+//! with synchronisation, pinning or providing [`Waker`]s. To demonstrate this, here is an example
+//! of a basic multithreaded executor that uses Smartpoll and the standard library:
 //!
 //! ```rust
 //! use smartpoll::Task;
-//! use std::sync::{
-//!     atomic::{AtomicUsize, Ordering},
-//!     mpsc::channel,
-//!     Arc,
+//! use std::{
+//!     sync::{
+//!         atomic::{AtomicUsize, Ordering},
+//!         mpsc, Arc,
+//!     },
+//!     thread,
+//!     time::Duration,
 //! };
 //!
-//! # fn yield_once() -> impl core::future::Future<Output = ()> {
-//! #     use core::{
-//! #         pin::Pin,
-//! #         task::{Context, Poll},
-//! #     };
-//! #     struct YieldFuture(bool);
-//! #     impl core::future::Future for YieldFuture {
-//! #         type Output = ();
-//! #         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//! #             if self.0 {
-//! #                 self.0 = false;
-//! #                 cx.waker().wake_by_ref();
-//! #                 Poll::Pending
-//! #             } else {
-//! #                 Poll::Ready(())
-//! #             }
-//! #         }
-//! #     }
-//! #     YieldFuture(true)
-//! # }
-//! #
-//! fn main() {
-//!     // the executor has a work queue and an 'unfinished tasks' counter
-//!     let (work_tx, work_rx) = channel();
-//!     let num_unfinished_tasks = Arc::new(AtomicUsize::new(0));
+//! // the executor has a work queue,
+//! let (queue_tx, queue_rx) = mpsc::channel::<Task>();
+//! // a counter that tracks the number of unfinished tasks (which is shared with each worker),
+//! let num_unfinished_tasks = Arc::new(AtomicUsize::new(0));
+//! // and a local counter that tracks which worker to send the next task to
+//! let mut next_worker = 0;
 //!
-//!     // to reschedule a task, push it onto the work queue
-//!     let reschedule_task = move |task| work_tx.send(task).unwrap();
+//! // to spawn a new task:
+//! let spawn_task = {
+//!     let queue_tx = queue_tx.clone();
+//!     let num_unfinished_tasks = num_unfinished_tasks.clone();
+//!     move |task| {
+//!         // increment the 'unfinished tasks' counter
+//!         num_unfinished_tasks.fetch_add(1, Ordering::SeqCst);
+//!         // and add the task onto the work queue
+//!         queue_tx.send(task).unwrap();
+//!     }
+//! };
 //!
-//!     let task_counter = num_unfinished_tasks.clone();
-//!     let schedule_task = reschedule_task.clone();
+//! // to reschedule a task, add it back onto the work queue
+//! let reschedule_task = move |task| queue_tx.send(task).unwrap();
 //!
-//!     // to spawn a task, add 1 to the counter and schedule the task
-//!     let spawn_task = move |task| {
-//!         task_counter.fetch_add(1, Ordering::SeqCst);
-//!         schedule_task(task);
-//!     };
+//! // for each worker:
+//! let num_workers = thread::available_parallelism().unwrap().into();
+//! let workers = (0..num_workers)
+//!     .map(|_| {
+//!         let num_unfinished_tasks = num_unfinished_tasks.clone();
+//!         let reschedule_task = reschedule_task.clone();
 //!
-//!     // spawn some tasks
-//!     spawn_task(Task::new(async {
-//!         // async code...
-//! #         println!("1");
-//! #         yield_once().await;
-//! #         println!("2");
-//!     }));
-//!     spawn_task(Task::new(async {
-//!         // async code...
-//! #         println!("A");
-//! #         yield_once().await;
-//! #         println!("B");
-//!     }));
+//!         // create a channel for sending tasks to the worker
+//!         let (work_tx, work_rx) = mpsc::sync_channel::<Task>(1);
 //!
-//!     while let Ok(task) = work_rx.recv() {
-//!         // poll the next task from the queue
-//!         if task.poll(reschedule_task.clone()).is_ready() {
-//!             // if the task has completed, subtract 1 from the counter
-//!             if num_unfinished_tasks.fetch_sub(1, Ordering::SeqCst) == 1 {
-//!                 // if the counter was 1, that was the last task
-//!                 break;
+//!         // on a new thread:
+//!         let join_handle = thread::spawn(move || {
+//!             // for each task that is sent to this worker, until the channel closes:
+//!             while let Ok(task) = work_rx.recv() {
+//!                 // poll the task
+//!                 if task.poll(reschedule_task.clone()).is_ready() {
+//!                     // and if it has completed then decrement the 'unfinished tasks' counter
+//!                     num_unfinished_tasks.fetch_sub(1, Ordering::SeqCst);
+//!                 }
+//!             }
+//!         });
+//!         (work_tx, join_handle)
+//!     })
+//!     .collect::<Vec<_>>();
+//!
+//! // spawn some tasks
+//! spawn_task(Task::new(async {
+//!     // async code...
+//! }));
+//! spawn_task(Task::new(async {
+//!     // async code...
+//! }));
+//!
+//! // while there are unfinished tasks:
+//! while num_unfinished_tasks.load(Ordering::SeqCst) > 0 {
+//!     // wait until a task is available from the queue
+//!     if let Ok(task) = queue_rx.recv_timeout(Duration::from_millis(100)) {
+//!         // send the task to the next available worker
+//!         let mut task = Some(task);
+//!         while let Err(mpsc::TrySendError::Full(returned_task)) =
+//!             workers[next_worker].0.try_send(task.take().unwrap())
+//!         {
+//!             // whenever a worker's channel is full, try the next worker
+//!             task = Some(returned_task);
+//!             next_worker += 1;
+//!             if next_worker == workers.len() {
+//!                 next_worker = 0;
 //!             }
 //!         }
 //!     }
 //! }
+//!
+//! // once all of the tasks have completed
+//! for (task_tx, join_handle) in workers.into_iter() {
+//!     // close each worker's channel
+//!     drop(task_tx);
+//!     // and wait for each worker's thread to finish
+//!     join_handle.join().unwrap();
+//! }
 //! ```
 //!
-//! For an implementation of a multithreaded executor, see this [example].
+//! For an explanation of how the library works and its correctness, see the [source].
 //!
-//! For an explanation of how the library works, and a proof of its correctness, see the [source].
-//!
-//! [example]: https://github.com/MilesCourtie/smartpoll/blob/main/examples/executor.rs
 //! [source]: https://github.com/MilesCourtie/smartpoll/blob/main/src/lib.rs
 
 #![no_std]
@@ -287,10 +303,10 @@ trait AnyTaskInner: Send + Sync {
     /// any thread until it has returned, even if the waker is invoked before this function returns.
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()>;
 
-    /// Returns a shared reference to the task's shared counter.
+    /// Returns a shared reference to the task's counter.
     fn counter(&self) -> &AtomicUsize;
 
-    /// Returns a mutable reference to the task's shared counter.
+    /// Returns a mutable reference to the task's counter.
     fn counter_mut(&mut self) -> &mut AtomicUsize;
 }
 
