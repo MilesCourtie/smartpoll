@@ -96,9 +96,9 @@
 //! }
 //!
 //! // once all of the tasks have completed
-//! for (task_tx, join_handle) in workers.into_iter() {
+//! for (work_tx, join_handle) in workers.into_iter() {
 //!     // close each worker's channel
-//!     drop(task_tx);
+//!     drop(work_tx);
 //!     // and wait for each worker's thread to finish
 //!     join_handle.join().unwrap();
 //! }
@@ -114,6 +114,7 @@ use core::{
     cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
+    panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
     sync::atomic::AtomicUsize,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -199,17 +200,11 @@ impl Task {
     ///
     /// If the future returned [`Poll::Pending`] and arranged for a [`Waker`] to be invoked,
     /// `reschedule_fn` will be called at some point and will be given ownership of this [`Task`].
-    /// In this scenario it is guaranteed that the callback will not run until the waker has been
+    /// If this occurs it is guaranteed that the callback will not run until the waker has been
     /// invoked *and* [`Future::poll`] has returned, and will be called exactly once. No further
     /// guarantees are made regarding when this callback will be invoked or on what thread. For
     /// example it may be called by a waker on an arbitrary thread in 10 minutes' time, or it might
     /// have already been called on the current thread as part of this function.
-    ///
-    /// Note that there is a very unlikely scenario in which the task may be spuriously rescheduled.
-    /// If a clone of a waker provided to the future is stored while the task is polled a further
-    /// `2^(N-2)` times, where `N` is the size of a pointer in bits, the task's internal counter
-    /// will wrap such that the stored waker will not be able to detect that it is outdated. If the
-    /// outdated waker is then invoked it may cause the task to be rescheduled.
     pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> Poll<()> {
         // the synchronisation algorithm is explained fully in the `algorithm` module
         use algorithm::task as steps;
@@ -219,14 +214,21 @@ impl Task {
         let mut start = steps::get_counter(&mut self.0);
 
         // Try to safely reset the counter every 2^16 polls (i.e. every 2^18 increments).
-        // This will succeed if there are no leftover wakers from previous polls, in which case it
-        // will prevent the counter from wrapping unexpectedly.
+        // This will succeed iff there are no leftover wakers from previous rounds, in which case it
+        // will prevent the counter from wrapping. If the counter did wrap, a leftover waker may not
+        // be unable to detect that it is outdated. Note that this could only occur if the advice in
+        // `Future::poll`'s documentation is ignored:
         //
-        // Note that even if the counter does wrap such that an outdated waker participates in a
-        // round which it shouldn't, no safety invariants can be violated because the outdated waker
-        // will still participate in the round properly, just as any other waker would. The worst
-        // possible outcome is that the task is rescheduled spuriously (but still in a valid way)
-        // as a result of the outdated waker's participation.
+        //  "on multiple calls to poll, only the Waker from the Context passed to the most recent
+        //  call should be scheduled to receive a wakeup"
+        //
+        // source: https://doc.rust-lang.org/std/future/trait.Future.html#tymethod.poll
+        //
+        // Note that even if the counter did wrap such that an outdated waker participates in a
+        // round which it shouldn't, no safety invariants could be violated because the outdated
+        // waker would still participate in the round properly, just as any other waker would. The
+        // worst outcome that this could cause is the task being rescheduled due to the outdated
+        // waker's invocation, before any of the wakers from the current round are invoked.
         let inner = if start & 0x3ffff == 0 {
             let (success, inner) = steps::try_reset_counter(self.0);
             if success {
@@ -280,6 +282,14 @@ impl Task {
         result
     }
 }
+
+/*  `Task` is unwind-safe because there are no places where any of the functions in this crate could
+    panic that would break any of the implementation's invariants. Any thread can stop participating
+    in the synchronisation algorithm at any point without breaking any invariants, and the worst
+    outcome this can cause is the task not being rescheduled.
+*/
+impl UnwindSafe for Task {}
+impl RefUnwindSafe for Task {}
 
 impl<F: Future<Output = ()> + Send> TaskInner<F> {
     /// Creates a new [`TaskInner`] that wraps around the provided [`Future`].
