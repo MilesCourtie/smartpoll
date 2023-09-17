@@ -1,17 +1,10 @@
 # Smartpoll
 
-Smartpoll is a Rust library which provides a `Task` abstraction that simplifies polling futures.
+Smartpoll makes it easy to build your own multithreaded executor for async Rust, by providing a `Task` abstraction that simplifies polling Rust's [`Futures`](https://doc.rust-lang.org/core/future/trait.Future.html).
 
-Please note that Smartpoll is still in early development and is not yet thoroughly tested.
-It is not currently recommended for use in production environments.
+Please note that until the crate reaches version 1.0.0, minor version increases may include breaking changes.
 
-## How it works
-
-Smartpoll's `Task` type wraps around a top-level future. Its `poll` method synchronises calls to
-`Future::poll` by communicating with the task's wakers to ensure that the task is not rescheduled
-until `Future::poll` has returned. The rescheduling code is a closure passed to `Task::poll`.
-
-See the [examples](examples) for more detailed usage information.
+See the [documentation](https://docs.rs/smartpoll/latest/smartpoll/) for more information.
 
 ## License
 
