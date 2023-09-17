@@ -20,10 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace initial implementation with faster version that uses atomics.
 - `Task::poll` now returns the output of `Future::poll`.
 - Rewrite the documentation.
+- Update crate metadata to reflect 'no_std' status.
 
 ### Removed
 
 - Original usage examples.
+- Dependency on `parking_lot` crate.
+- Dependency on standard library.
 
 ## [0.1.1] - 2023-06-18
 
