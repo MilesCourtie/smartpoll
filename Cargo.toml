@@ -7,5 +7,5 @@ license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/MilesCourtie/smartpoll"
 repository = "https://github.com/MilesCourtie/smartpoll"
-categories = ["asynchronous"]
-keywords = ["async", "executor", "futures", "task"]
+categories = ["asynchronous", "no-std"]
+keywords = ["async", "executor", "futures", "task", "no_std"]
