@@ -114,7 +114,6 @@ use core::{
     cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
-    panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
     sync::atomic::AtomicUsize,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -283,13 +282,16 @@ impl Task {
     }
 }
 
-/*  `Task` is unwind-safe because there are no places where any of the functions in this crate could
-    panic that would break any of the implementation's invariants. Any thread can stop participating
-    in the synchronisation algorithm at any point without breaking any invariants, and the worst
-    outcome this can cause is the task not being rescheduled.
+/*  Regarding unwind safety:
+    None of this crate's internal invariants can be broken by a panic: if a thread suddenly stops
+    participating at any point in the synchronisation algorithm it might stop that task from being
+    rescheduled, but no logical or safety invariants will be broken.
+
+    However, `Task` does not implement `UnwindSafe` because the future it contains is not required
+    to be `UnwindSafe`. If a user of this crate wishes to catch any unwinding panics that come from
+    within a `Task`, they can use the `AssertUnwindSafe` wrapper to do so if they are confident that
+    it will not create any logic bugs in their program.
 */
-impl UnwindSafe for Task {}
-impl RefUnwindSafe for Task {}
 
 impl<F: Future<Output = ()> + Send> TaskInner<F> {
     /// Creates a new [`TaskInner`] that wraps around the provided [`Future`].
@@ -363,7 +365,7 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
 }
 
 /// A [`Waker`] that communicates with its [`Task`] to ensure that the task is not rescheduled
-/// until the waker has been invoked and []`Future::poll`] has returned, and that it is only
+/// until the waker has been invoked and [`Future::poll`] has returned, and that it is only
 /// rescheduled at most once per poll.
 #[derive(Clone)]
 struct SmartWaker<WakeFn: Fn(Task) + Send + Clone> {
