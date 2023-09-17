@@ -37,3 +37,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial implementation using mutexes.
 - Examples demonstrating how to use the crate.
+- Basic documentation.
