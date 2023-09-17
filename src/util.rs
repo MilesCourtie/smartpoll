@@ -131,14 +131,14 @@ mod sequencer {
                 sequence_i = sequence.len() - 1;
 
                 // once we've reached the end of the sequence
-                if let Some(next_uncompleted_i) = future_completed_at_index
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, &time_of_completion)| time_of_completion.is_none().then_some(i))
+                if let Some(next_uncompleted_future_i) =
+                    future_completed_at_index.iter().enumerate().find_map(
+                        |(future_i, &completion_i)| completion_i.is_none().then_some(future_i),
+                    )
                 {
                     // if there is a future that has not yet completed
                     // add it to the sequence and continue
-                    sequence.push(next_uncompleted_i);
+                    sequence.push(next_uncompleted_future_i);
                     sequence_i += 1;
                     continue 'next_future;
                 } else {
