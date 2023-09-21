@@ -22,7 +22,7 @@
 //! };
 //!
 //! // the executor has a work queue,
-//! let (queue_tx, queue_rx) = mpsc::channel::<Task>();
+//! let (queue_tx, queue_rx) = mpsc::channel::<Task<()>>();
 //! // a counter that tracks the number of unfinished tasks (which is shared with each worker),
 //! let num_unfinished_tasks = Arc::new(AtomicUsize::new(0));
 //! // and a local counter that tracks which worker to send the next task to
@@ -51,7 +51,7 @@
 //!         let reschedule_task = reschedule_task.clone();
 //!
 //!         // create a channel for sending tasks to the worker
-//!         let (work_tx, work_rx) = mpsc::sync_channel::<Task>(1);
+//!         let (work_tx, work_rx) = mpsc::sync_channel::<Task<()>>(1);
 //!
 //!         // on a new thread:
 //!         let join_handle = thread::spawn(move || {
@@ -69,10 +69,10 @@
 //!     .collect::<Vec<_>>();
 //!
 //! // spawn some tasks
-//! spawn_task(Task::new(async {
+//! spawn_task(Task::new((), async {
 //!     // async code...
 //! }));
-//! spawn_task(Task::new(async {
+//! spawn_task(Task::new((), async {
 //!     // async code...
 //! }));
 //!
@@ -168,7 +168,7 @@ mod algorithm;
 mod util;
 
 /// A [`Task`] wraps around a [`Future`] to provide a simple interface for polling it.
-pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
+pub struct Task<M: Send>(Pin<Arc<dyn AnyTaskInner<Metadata = M>>>);
 
 /*  When a future is polled it is given a waker that it can use to reschedule the task. To prevent
     the task from being polled again before the waker has been invoked, calling `Task::poll()` takes
@@ -180,19 +180,21 @@ pub struct Task(Pin<Arc<dyn AnyTaskInner>>);
 */
 
 /// A dynamically-sized type which stores a task's future and associated data.
-struct TaskInner<F: Future<Output = ()> + Send> {
+struct TaskInner<M: Send, F: Future<Output = ()> + Send> {
     /// marks this type as !Unpin
     _pin: PhantomPinned,
     /// a counter that is shared between the task and its wakers to coordinate rescheduling
     counter: AtomicUsize,
+    /// the task's metadata
+    metadata: M,
     /// the task's [`Future`]
     future: UnsafeCell<F>,
 }
 
-impl Task {
-    /// Creates a [`Task`] from the provided [`Future`].
-    pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self(Arc::pin(TaskInner::new(future)))
+impl<M: Send + 'static> Task<M> {
+    /// Creates a [`Task`] with the provided metadata that contains the provided [`Future`].
+    pub fn new(metadata: M, future: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(Arc::pin(TaskInner::new(metadata, future)))
     }
 
     /// Polls the task, returning the output from [`Future::poll`].
@@ -204,7 +206,7 @@ impl Task {
     /// guarantees are made regarding when this callback will be invoked or on what thread. For
     /// example it may be called by a waker on an arbitrary thread in 10 minutes' time, or it might
     /// have already been called on the current thread as part of this function.
-    pub fn poll(mut self, reschedule_fn: impl Fn(Task) + Send + Clone) -> Poll<()> {
+    pub fn poll(mut self, reschedule_fn: impl Fn(Task<M>) + Send + Clone) -> Poll<()> {
         // the synchronisation algorithm is explained fully in the `algorithm` module
         use algorithm::task as steps;
 
@@ -293,11 +295,12 @@ impl Task {
     it will not create any logic bugs in their program.
 */
 
-impl<F: Future<Output = ()> + Send> TaskInner<F> {
+impl<M: Send, F: Future<Output = ()> + Send> TaskInner<M, F> {
     /// Creates a new [`TaskInner`] that wraps around the provided [`Future`].
-    fn new(future: F) -> Self {
+    fn new(metadata: M, future: F) -> Self {
         Self {
             _pin: PhantomPinned,
+            metadata,
             counter: AtomicUsize::new(0),
             future: UnsafeCell::new(future),
         }
@@ -307,6 +310,9 @@ impl<F: Future<Output = ()> + Send> TaskInner<F> {
 /// This trait provides dynamic dispatch over any `TaskInner` instance, i.e. over any [`Future`]
 /// that is stored in a [`Task`].
 trait AnyTaskInner: Send + Sync {
+    /// The type of the task's metadata
+    type Metadata;
+
     /// Polls the task's future using the provided waker. Should only be called by `Task::poll`.
     ///
     /// # Safety
@@ -332,9 +338,11 @@ trait AnyTaskInner: Send + Sync {
     The future contained within the `TaskInner` does not need to be `Sync` because access to it is
     synchronised as described above.
 */
-unsafe impl<F: Future<Output = ()> + Send> Sync for TaskInner<F> {}
+unsafe impl<M: Send, F: Future<Output = ()> + Send> Sync for TaskInner<M, F> {}
 
-impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
+impl<M: Send, F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<M, F> {
+    type Metadata = M;
+
     unsafe fn poll(self: Pin<&Self>, waker: &Waker) -> Poll<()> {
         /* SAFETY:
             Because the caller has guaranteed that this function will not be called on this instance
@@ -367,10 +375,9 @@ impl<F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<F> {
 /// A [`Waker`] that communicates with its [`Task`] to ensure that the task is not rescheduled
 /// until the waker has been invoked and [`Future::poll`] has returned, and that it is only
 /// rescheduled at most once per poll.
-#[derive(Clone)]
-struct SmartWaker<WakeFn: Fn(Task) + Send + Clone> {
+struct SmartWaker<M: Send, WakeFn: Fn(Task<M>) + Send + Clone> {
     /// the inner storage of the task that created this waker
-    task_inner: Pin<Arc<dyn AnyTaskInner>>,
+    task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
     /// the value of the task's counter when this waker was created, i.e. at the start of this
     /// round of the synchronisation algorithm
     start: usize,
@@ -378,10 +385,20 @@ struct SmartWaker<WakeFn: Fn(Task) + Send + Clone> {
     reschedule_fn: WakeFn,
 }
 
-impl<RescheduleFn: Fn(Task) + Send + Clone> SmartWaker<RescheduleFn> {
+impl<M: Send, RescheduleFn: Fn(Task<M>) + Send + Clone> Clone for SmartWaker<M, RescheduleFn> {
+    fn clone(&self) -> Self {
+        Self {
+            task_inner: self.task_inner.clone(),
+            start: self.start,
+            reschedule_fn: self.reschedule_fn.clone(),
+        }
+    }
+}
+
+impl<M: Send, RescheduleFn: Fn(Task<M>) + Send + Clone> SmartWaker<M, RescheduleFn> {
     /// Creates a new [`SmartWaker`] and returns it in the form of a [`Waker`].
     fn new_waker(
-        task_inner: Pin<Arc<dyn AnyTaskInner>>,
+        task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
         reschedule_fn: RescheduleFn,
         start: usize,
     ) -> Waker {

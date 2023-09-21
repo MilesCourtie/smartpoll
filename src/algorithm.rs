@@ -95,16 +95,18 @@ pub(crate) mod task {
     use alloc::sync::Arc;
 
     /// The first step of the algorithm. Returns the value of the counter.
-    pub(crate) fn get_counter(task_inner: &mut Pin<Arc<dyn AnyTaskInner>>) -> usize {
+    pub(crate) fn get_counter<M: Send>(
+        task_inner: &mut Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
+    ) -> usize {
         task_inner.counter().load(Ordering::SeqCst)
     }
 
     /// The task thread occasionally calls this before polling the task to try and keep the counter
     /// from overflowing. Returns a bool that is true iff the counter was reset, and gives back
     /// ownership of the `TaskInner` instance, which must have no clones for this to succeed.
-    pub(crate) fn try_reset_counter(
-        task_inner: Pin<Arc<dyn AnyTaskInner>>,
-    ) -> (bool, Pin<Arc<dyn AnyTaskInner>>) {
+    pub(crate) fn try_reset_counter<M: Send>(
+        task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
+    ) -> (bool, Pin<Arc<dyn AnyTaskInner<Metadata = M>>>) {
         /* SAFETY:
             We remove the Pin from the Arc and immediately put it back after attempting to
             reset the counter. No data is moved or dropped so the pinning contract is not violated.
