@@ -168,7 +168,7 @@ mod algorithm;
 mod util;
 
 /// A [`Task`] wraps around a [`Future`] to provide a simple interface for polling it.
-pub struct Task<M: Send>(Pin<Arc<dyn AnyTaskInner<Metadata = M>>>);
+pub struct Task<M: Send + 'static>(Pin<Arc<dyn AnyTaskInner<Metadata = M>>>);
 
 /*  When a future is polled it is given a waker that it can use to reschedule the task. To prevent
     the task from being polled again before the waker has been invoked, calling `Task::poll()` takes
@@ -375,7 +375,7 @@ impl<M: Send, F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<M, F> {
 /// A [`Waker`] that communicates with its [`Task`] to ensure that the task is not rescheduled
 /// until the waker has been invoked and [`Future::poll`] has returned, and that it is only
 /// rescheduled at most once per poll.
-struct SmartWaker<M: Send, WakeFn: Fn(Task<M>) + Send + Clone> {
+struct SmartWaker<M: Send + 'static, WakeFn: Fn(Task<M>) + Send + Clone> {
     /// the inner storage of the task that created this waker
     task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
     /// the value of the task's counter when this waker was created, i.e. at the start of this
@@ -395,7 +395,7 @@ impl<M: Send, RescheduleFn: Fn(Task<M>) + Send + Clone> Clone for SmartWaker<M, 
     }
 }
 
-impl<M: Send, RescheduleFn: Fn(Task<M>) + Send + Clone> SmartWaker<M, RescheduleFn> {
+impl<M: Send + 'static, RescheduleFn: Fn(Task<M>) + Send + Clone> SmartWaker<M, RescheduleFn> {
     /// Creates a new [`SmartWaker`] and returns it in the form of a [`Waker`].
     fn new_waker(
         task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
