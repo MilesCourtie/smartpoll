@@ -282,6 +282,11 @@ impl<M: Send + 'static> Task<M> {
         // return the output from the future
         result
     }
+
+    /// Returns a shared reference to the task's metadata.
+    pub fn metadata(&self) -> &M {
+        self.0.metadata()
+    }
 }
 
 /*  Regarding unwind safety:
@@ -326,6 +331,9 @@ trait AnyTaskInner: Send + Sync {
 
     /// Returns a mutable reference to the task's counter.
     fn counter_mut(&mut self) -> &mut AtomicUsize;
+
+    /// Returns a shared reference to the task's metadata.
+    fn metadata(&self) -> &Self::Metadata;
 }
 
 /* SAFETY:
@@ -369,6 +377,10 @@ impl<M: Send, F: Future<Output = ()> + Send> AnyTaskInner for TaskInner<M, F> {
 
     fn counter_mut(&mut self) -> &mut AtomicUsize {
         &mut self.counter
+    }
+
+    fn metadata(&self) -> &Self::Metadata {
+        &self.metadata
     }
 }
 
