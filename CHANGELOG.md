@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2023-10-05
+
 ### Added
 
 - Tasks can now store arbitrary metadata of any type that implements `Send`.
