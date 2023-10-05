@@ -528,3 +528,28 @@ impl<M: Send + 'static, RescheduleFn: Fn(Task<M>) + Send + Clone> SmartWaker<M, 
         drop(this);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{util::yield_once, Task};
+    extern crate alloc;
+    use alloc::boxed::Box;
+
+    #[test]
+    fn metadata_is_preserved() {
+        //! Check that the metadata of the task passed to the rescheduling callback is the same
+        //! metadata that was passed to the original task.
+
+        let task = Task::new(Box::new(()), yield_once());
+
+        // the task's metadata is a Box that points to a unique address
+        let addr = (&**task.metadata() as *const _) as usize;
+
+        task.poll(move |task| {
+            // Check that the task's metadata is the original Box by checking that it is a Box which
+            // points to the same address as the original.
+            assert!(addr == (&**task.metadata() as *const _) as usize)
+        })
+        .is_ready();
+    }
+}
