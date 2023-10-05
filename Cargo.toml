@@ -2,6 +2,7 @@
 name = "smartpoll"
 description = "A 'Task' abstraction that simplifies polling futures."
 version = "0.1.1"
+authors = ["Miles Courtie"]
 edition = "2021"
 license = "MIT"
 readme = "README.md"
