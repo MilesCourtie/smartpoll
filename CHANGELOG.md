@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tasks can now store arbitrary metadata of any type that implements `Send`.
 - Tests that check the correctness of the synchronisation algorithm by simulating all possible
   thread schedulings for each test case.
 - Explain the implementation, testing method, caveats and edge cases thoroughly in comments.
