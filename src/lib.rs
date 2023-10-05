@@ -6,6 +6,8 @@
 //! again. This will be invoked if the task does not complete, but only once the task is ready to be
 //! rescheduled.
 //!
+//! Tasks can also store metadata of any type that implements [`Send`].
+//!
 //! Polling tasks is much simpler than polling their futures directly as you do not have to deal
 //! with synchronisation, pinning or providing [`Waker`]s. To demonstrate this, here is an example
 //! of a basic multithreaded executor that uses Smartpoll and the standard library:
@@ -192,7 +194,7 @@ struct TaskInner<M: Send, F: Future<Output = ()> + Send> {
 }
 
 impl<M: Send + 'static> Task<M> {
-    /// Creates a [`Task`] with the provided metadata that contains the provided [`Future`].
+    /// Converts the provided [`Future`] into a [`Task`] with the provided metadata.
     pub fn new(metadata: M, future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self(Arc::pin(TaskInner::new(metadata, future)))
     }
