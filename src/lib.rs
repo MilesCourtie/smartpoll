@@ -194,7 +194,7 @@ struct TaskInner<M: Send, F: Future<Output = ()> + Send> {
 }
 
 impl<M: Send + 'static> Task<M> {
-    /// Converts the provided [`Future`] into a [`Task`] with the provided metadata.
+    /// Converts the provided [`Future`] into a [`Task`] that contains the provided metadata.
     pub fn new(metadata: M, future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self(Arc::pin(TaskInner::new(metadata, future)))
     }
