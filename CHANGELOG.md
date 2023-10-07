@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2023-10-07
+
+### Fixed
+
+- Add `'static` bound to parameter `reschedule_fn` of `Task::poll()`.
+
 ## [1.0.0] - 2023-10-05
 
 ### Added
