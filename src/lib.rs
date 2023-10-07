@@ -208,7 +208,7 @@ impl<M: Send + 'static> Task<M> {
     /// guarantees are made regarding when this callback will be invoked or on what thread. For
     /// example it may be called by a waker on an arbitrary thread in 10 minutes' time, or it might
     /// have already been called on the current thread as part of this function.
-    pub fn poll(mut self, reschedule_fn: impl Fn(Task<M>) + Send + Clone) -> Poll<()> {
+    pub fn poll(mut self, reschedule_fn: impl Fn(Task<M>) + Send + Clone + 'static) -> Poll<()> {
         // the synchronisation algorithm is explained fully in the `algorithm` module
         use algorithm::task as steps;
 
@@ -409,7 +409,11 @@ impl<M: Send, RescheduleFn: Fn(Task<M>) + Send + Clone> Clone for SmartWaker<M, 
     }
 }
 
-impl<M: Send + 'static, RescheduleFn: Fn(Task<M>) + Send + Clone> SmartWaker<M, RescheduleFn> {
+impl<M, RescheduleFn> SmartWaker<M, RescheduleFn>
+where
+    M: Send + 'static,
+    RescheduleFn: Fn(Task<M>) + Send + Clone + 'static,
+{
     /// Creates a new [`SmartWaker`] and returns it in the form of a [`Waker`].
     fn new_waker(
         task_inner: Pin<Arc<dyn AnyTaskInner<Metadata = M>>>,
